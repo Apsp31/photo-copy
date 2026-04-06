@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+config.json
+audit_log_*.txt
+.venv/
+venv/

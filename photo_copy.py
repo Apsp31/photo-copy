@@ -1,0 +1,436 @@
+"""
+Photo Organizer (v4)
+
+Purpose
+- Desktop GUI tool to scan and copy photos and videos from a source folder to a destination library organized by capture date.
+
+Key Features
+- Source/destination selection, start/end date filtering (tkcalendar DateEntry)
+- Date extraction from filenames (YYYY-MM-DD / YYYYMMDD) and EXIF for images
+- Video date fallback to filesystem modification time when no date is present
+- Duplicate detection (size, mtime, partial MD5 for large files)
+- Multi-threaded copying with progress and Cancel support
+- Audit log written to destination root, and config.json persistence
+
+Output Structure
+- Files placed under `<dest>/<year>/<YYYY-MM-DD>`; undated files go to `<dest>/Undated`
+
+Requirements
+- Python 3.x, Pillow (PIL), tkcalendar, tkinter-enabled desktop environment
+
+Version Notes (v4)
+- Added support for common video formats (.mp4, .mov, .m4v, .avi, .mkv, .mts, .m2ts, .3gp, .wmv, .webm)
+- Implemented video date fallback using modification time (mtime) when filename/metadata dates are unavailable
+"""
+
+import os
+import shutil
+import sys
+import hashlib
+import json
+from datetime import datetime
+from time import time
+from PIL import Image
+from PIL.ExifTags import TAGS
+import re
+from tkcalendar import DateEntry
+import threading
+import concurrent.futures
+
+# Fallback if tkinter is not available
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError:
+    print("Error: tkinter module is not available in this environment.")
+    print("Please install it or run this script in a desktop environment that supports tkinter.")
+    sys.exit(1)
+
+class PhotoOrganizer:
+    CONFIG_FILE = "config.json"
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Photo Organizer")
+
+        self.source_folder = tk.StringVar()
+        self.dest_root_folder = tk.StringVar()
+        self.status_text = tk.StringVar(value="Ready.")
+        self.cancel_operation = False
+
+        self.setup_gui()
+        self.files_to_copy = []
+        self.load_config()
+
+    def setup_gui(self):
+        tk.Label(self.root, text="Source Folder:").grid(row=0, column=0, sticky='e')
+        tk.Entry(self.root, textvariable=self.source_folder, width=50).grid(row=0, column=1)
+        tk.Button(self.root, text="Browse", command=self.browse_source).grid(row=0, column=2)
+
+        tk.Label(self.root, text="Destination Root Folder:").grid(row=1, column=0, sticky='e')
+        tk.Entry(self.root, textvariable=self.dest_root_folder, width=50).grid(row=1, column=1)
+        tk.Button(self.root, text="Browse", command=self.browse_dest_root).grid(row=1, column=2)
+
+        tk.Button(self.root, text="Scan for Files", command=self.scan_files).grid(row=2, column=1, pady=10)
+        tk.Button(self.root, text="Copy Files", command=self.copy_files).grid(row=2, column=2, pady=10)
+        self.cancel_button = tk.Button(self.root, text="Cancel", command=self.cancel_current_operation, state=tk.DISABLED)
+        self.cancel_button.grid(row=2, column=0, pady=10)
+
+        self.tree = ttk.Treeview(self.root, columns=("Source", "Target"), show='headings')
+        self.tree.heading("Source", text="Source File")
+        self.tree.heading("Target", text="Target Path")
+        self.tree.grid(row=3, column=0, columnspan=3, sticky='nsew')
+
+        self.progress = ttk.Progressbar(self.root, mode='determinate')
+        self.progress.grid(row=4, column=0, columnspan=3, sticky='we', pady=(5, 0))
+
+        self.status_label = tk.Label(self.root, textvariable=self.status_text, anchor='w')
+        self.status_label.grid(row=5, column=0, columnspan=3, sticky='we', pady=(2, 5))
+
+        tk.Label(self.root, text="Start Date:").grid(row=6, column=0, sticky='e')
+        self.start_date_picker = DateEntry(self.root, width=20, date_pattern="yyyy-MM-dd")
+        self.start_date_picker.grid(row=6, column=1, sticky='w')
+
+        tk.Label(self.root, text="End Date:").grid(row=7, column=0, sticky='e')
+        self.end_date_picker = DateEntry(self.root, width=20, date_pattern="yyyy-MM-dd")
+        self.end_date_picker.grid(row=7, column=1, sticky='w')
+
+        self.root.grid_rowconfigure(3, weight=1)
+        self.root.grid_columnconfigure(1, weight=1)
+
+    def load_config(self):
+        if os.path.exists(self.CONFIG_FILE):
+            try:
+                with open(self.CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    self.source_folder.set(config.get("source_folder", ""))
+                    self.dest_root_folder.set(config.get("dest_root_folder", ""))
+                    start_date = config.get("start_date", "")
+                    end_date = config.get("end_date", "")
+                    if start_date:
+                        self.start_date_picker.set_date(datetime.strptime(start_date, "%Y-%m-%d").date())
+                    if end_date:
+                        self.end_date_picker.set_date(datetime.strptime(end_date, "%Y-%m-%d").date())
+            except Exception as e:
+                print(f"Error loading config: {e}")
+
+    def save_config(self):
+        config = {
+            "source_folder": self.source_folder.get(),
+            "dest_root_folder": self.dest_root_folder.get(),
+            "start_date": self.start_date_picker.get_date().strftime("%Y-%m-%d"),
+            "end_date": self.end_date_picker.get_date().strftime("%Y-%m-%d")
+        }
+        try:
+            with open(self.CONFIG_FILE, 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    def browse_source(self):
+        self.source_folder.set(os.path.normpath(filedialog.askdirectory()))
+        self.save_config()
+
+    def browse_dest_root(self):
+        self.dest_root_folder.set(os.path.normpath(filedialog.askdirectory()))
+        self.save_config()
+
+    def get_exif_date(self, file_path):
+        try:
+            with Image.open(file_path) as image:
+                exif_data = image._getexif()
+                if exif_data:
+                    date_original = exif_data.get(36867)
+                    if date_original:
+                        return datetime.strptime(date_original, "%Y:%m:%d %H:%M:%S")
+                    date_time = exif_data.get(306)
+                    if date_time:
+                        return datetime.strptime(date_time, "%Y:%m:%d %H:%M:%S")
+        except:
+            pass
+        return None
+
+    def get_file_date(self, file_path):
+        filename = os.path.basename(file_path)
+        try:
+            if len(filename) >= 10 and filename[4] == '-' and filename[7] == '-':
+                try:
+                    return datetime.strptime(filename[:10], "%Y-%m-%d")
+                except ValueError:
+                    pass
+            if len(filename) >= 8:
+                try:
+                    date_part = filename[:8]
+                    if date_part.isdigit():
+                        return datetime.strptime(date_part, "%Y%m%d")
+                except ValueError:
+                    pass
+            for i in range(len(filename) - 9):
+                if filename[i+4] == '-' and filename[i+7] == '-':
+                    try:
+                        date_part = filename[i:i+10]
+                        return datetime.strptime(date_part, "%Y-%m-%d")
+                    except ValueError:
+                        pass
+            for i in range(len(filename) - 7):
+                date_part = filename[i:i+8]
+                if date_part.isdigit():
+                    try:
+                        return datetime.strptime(date_part, "%Y%m%d")
+                    except ValueError:
+                        pass
+        except:
+            pass
+        date = self.get_exif_date(file_path)
+        if date:
+            return date
+        try:
+            if self.is_video_file(file_path):
+                return datetime.fromtimestamp(os.path.getmtime(file_path))
+        except:
+            pass
+        return None
+
+    def files_are_identical(self, f1, f2):
+        try:
+            stat1 = os.stat(f1)
+            stat2 = os.stat(f2)
+            if stat1.st_size != stat2.st_size:
+                return False
+            if stat1.st_mtime == stat2.st_mtime and stat1.st_size == stat2.st_size:
+                return True
+            if stat1.st_size < 8192:
+                with open(f1, 'rb') as file1, open(f2, 'rb') as file2:
+                    return file1.read() == file2.read()
+            def smart_partial_hash(path, file_size, blocksize=2 * 1024 * 1024):
+                hasher = hashlib.md5()
+                with open(path, 'rb') as afile:
+                    buf = afile.read(blocksize)
+                    hasher.update(buf)
+                    if file_size > blocksize * 3:
+                        afile.seek(file_size // 2)
+                        buf = afile.read(blocksize)
+                        hasher.update(buf)
+                        afile.seek(-blocksize, 2)
+                        buf = afile.read(blocksize)
+                        hasher.update(buf)
+                return hasher.digest()
+            return smart_partial_hash(f1, stat1.st_size) == smart_partial_hash(f2, stat1.st_size)
+        except (OSError, IOError):
+            return False
+
+    def validate_paths(self):
+        src = self.source_folder.get()
+        dst = self.dest_root_folder.get()
+        if not os.path.isdir(src):
+            messagebox.showerror("Invalid Source", "The selected source folder does not exist.")
+            return False
+        if not os.path.isdir(dst):
+            messagebox.showerror("Invalid Destination", "The selected destination folder does not exist.")
+            return False
+        return True
+
+    def find_matching_folder(self, date):
+        year_path = os.path.join(self.dest_root_folder.get(), str(date.year))
+        if not os.path.exists(year_path):
+            return None
+        if not hasattr(self, '_dir_cache'):
+            self._dir_cache = {}
+        if year_path not in self._dir_cache:
+            try:
+                self._dir_cache[year_path] = [entry.name for entry in os.scandir(year_path) if entry.is_dir()]
+            except OSError:
+                return None
+        prefix = date.strftime("%Y-%m-%d")
+        for entry in self._dir_cache[year_path]:
+            if entry.startswith(prefix):
+                return os.path.join(year_path, entry)
+        return None
+
+    def scan_files(self):
+        def scan():
+            self.cancel_operation = False
+            self.cancel_button.config(state=tk.NORMAL)
+            self.save_config()
+            if not self.validate_paths():
+                self.cancel_button.config(state=tk.DISABLED)
+                return
+            start_date = self.start_date_picker.get_date()
+            end_date = self.end_date_picker.get_date()
+            self.tree.delete(*self.tree.get_children())
+            self.files_to_copy.clear()
+            self.progress['value'] = 0
+            self.status_text.set("Scanning...")
+            self.root.update_idletasks()
+            start_time = time()
+            processed_files = 0
+            found_files = 0
+            scanned_count = 0
+            self._dir_cache = {}
+            def scan_directory(path):
+                try:
+                    with os.scandir(path) as entries:
+                        files = []
+                        dirs = []
+                        for entry in entries:
+                            if entry.is_file():
+                                files.append(entry.name)
+                            elif entry.is_dir():
+                                dirs.append(entry.path)
+                        return files, dirs
+                except OSError:
+                    return [], []
+            dirs_to_scan = [self.source_folder.get()]
+            batch_files = []
+            while dirs_to_scan:
+                if self.cancel_operation:
+                    self.status_text.set("Operation cancelled.")
+                    self.cancel_button.config(state=tk.DISABLED)
+                    return
+                current_dir = dirs_to_scan.pop()
+                files, subdirs = scan_directory(current_dir)
+                dirs_to_scan.extend(subdirs)
+                found_files += len(files)
+                for file in files:
+                    if self.cancel_operation:
+                        self.status_text.set("Operation cancelled.")
+                        self.cancel_button.config(state=tk.DISABLED)
+                        return
+                    scanned_count += 1
+                    if not self.is_image_file(file):
+                        continue
+                    file_path = os.path.normpath(os.path.join(current_dir, file))
+                    date = self.get_file_date(file_path)
+                    if date and not (start_date <= date.date() <= end_date):
+                        continue
+                    if date:
+                        year_folder = os.path.normpath(os.path.join(self.dest_root_folder.get(), str(date.year)))
+                        date_folder = self.find_matching_folder(date)
+                        if not date_folder:
+                            date_folder = os.path.normpath(os.path.join(year_folder, date.strftime("%Y-%m-%d")))
+                    else:
+                        date_folder = os.path.normpath(os.path.join(self.dest_root_folder.get(), "Undated"))
+                    dest_file_path = os.path.normpath(os.path.join(date_folder, file))
+                    if os.path.exists(dest_file_path):
+                        try:
+                            src_size = os.path.getsize(file_path)
+                            dst_size = os.path.getsize(dest_file_path)
+                            if src_size == dst_size:
+                                if self.files_are_identical(file_path, dest_file_path):
+                                    continue
+                            base, ext = os.path.splitext(dest_file_path)
+                            counter = 1
+                            while os.path.exists(dest_file_path):
+                                dest_file_path = os.path.normpath(f"{base}_{counter}{ext}")
+                                counter += 1
+                        except OSError:
+                            pass
+                    batch_files.append((file_path, dest_file_path))
+                    processed_files += 1
+                    if len(batch_files) >= 50:
+                        for src, dst in batch_files:
+                            self.files_to_copy.append((src, dst))
+                            self.tree.insert("", "end", values=(src, dst))
+                        batch_files.clear()
+                        self.progress['value'] = (scanned_count / max(found_files, 1)) * 100
+                        self.status_text.set(f"Scanning... {scanned_count}/{found_files} files processed. Found {processed_files} to copy.")
+                        self.root.update_idletasks()
+                if found_files % 500 == 0:
+                    self.status_text.set(f"Found {found_files} files, processed {processed_files}")
+                    self.root.update_idletasks()
+            for src, dst in batch_files:
+                self.files_to_copy.append((src, dst))
+                self.tree.insert("", "end", values=(src, dst))
+            elapsed = time() - start_time
+            self.status_text.set(f"Scanned {scanned_count} files. {len(self.files_to_copy)} new files ready to copy. Time: {elapsed:.2f}s")
+            self.root.update_idletasks()
+            self.cancel_button.config(state=tk.DISABLED)
+        threading.Thread(target=scan).start()
+
+    def _copy_single_file(self, src, dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        return dst
+
+    def copy_files(self):
+        if not self.files_to_copy:
+            messagebox.showinfo("No Files", "There are no files to copy.")
+            return
+        self.cancel_operation = False
+        self.cancel_button.config(state=tk.NORMAL)
+        total = len(self.files_to_copy)
+        self.progress['value'] = 0
+        self.status_text.set("Copying...")
+        self.root.update_idletasks()
+        start_time = time()
+        audit_log = {}
+        copied_count = 0
+        max_workers = min(10, os.cpu_count() or 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {}
+            for i, (src, dst) in enumerate(self.files_to_copy):
+                if self.cancel_operation:
+                    break
+                future_to_file[executor.submit(self._copy_single_file, src, dst)] = (i, src, dst)
+            for future in concurrent.futures.as_completed(future_to_file):
+                if self.cancel_operation:
+                    executor.shutdown(wait=False)
+                    self.status_text.set("Operation cancelled.")
+                    self.cancel_button.config(state=tk.DISABLED)
+                    return
+                i, src, dst = future_to_file[future]
+                try:
+                    dst_path = future.result()
+                    copied_count += 1
+                    output_folder = os.path.dirname(dst)
+                    if output_folder not in audit_log:
+                        audit_log[output_folder] = []
+                    audit_log[output_folder].append(os.path.basename(dst))
+                    if copied_count % 5 == 0 or copied_count == total:
+                        self.progress['value'] = (copied_count / total) * 100
+                        self.status_text.set(f"Copying... {copied_count}/{total} files copied.")
+                        self.root.update_idletasks()
+                except Exception as e:
+                    print(f"Error copying {src} to {dst}: {e}")
+        elapsed = time() - start_time
+        self.status_text.set(f"Copied {copied_count} files in {elapsed:.2f} seconds.")
+        messagebox.showinfo("Done", f"Copied {copied_count} files.")
+        self.root.update_idletasks()
+        self.cancel_button.config(state=tk.DISABLED)
+        self.write_audit_log(audit_log)
+        self.scan_files()
+
+    def write_audit_log(self, audit_log):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.normpath(os.path.join(self.dest_root_folder.get(), f"audit_log_{timestamp}.txt"))
+        try:
+            with open(log_file, 'w') as f:
+                for folder, files in audit_log.items():
+                    f.write(f"Folder: {os.path.normpath(folder)}\n")
+                    for file in files:
+                        f.write(f"  {os.path.normpath(file)}\n")
+                    f.write("\n")
+            print(f"Audit log written to {log_file}")
+        except Exception as e:
+            print(f"Error writing audit log: {e}")
+
+    def cancel_current_operation(self):
+        self.cancel_operation = True
+        self.status_text.set("Cancelling operation...")
+
+    def is_image_file(self, filename):
+        if not hasattr(self, '_image_extensions_set'):
+            self._image_extensions_set = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.heic', '.raw', '.cr2', '.nef', '.dng', '.arw', '.orf', '.mp4', '.mov', '.m4v', '.avi', '.mkv', '.mts', '.m2ts', '.3gp', '.wmv', '.webm'}
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in self._image_extensions_set
+
+    def is_video_file(self, filename):
+        if not hasattr(self, '_video_extensions_set'):
+            self._video_extensions_set = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.mts', '.m2ts', '.3gp', '.wmv', '.webm'}
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in self._video_extensions_set
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PhotoOrganizer(root)
+    root.mainloop()
