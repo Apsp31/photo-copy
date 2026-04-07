@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
+APP_VERSION = "5.3.0"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
@@ -417,7 +418,7 @@ class PhotoOrganizer(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Photo Organizer")
+        self.setWindowTitle(f"Photo Organizer v{APP_VERSION}")
         self.resize(960, 640)
 
         self._files_to_copy: list[tuple[str, str]] = []
@@ -514,8 +515,11 @@ class PhotoOrganizer(QMainWindow):
         self._progress.setValue(0)
         vbox.addWidget(self._progress)
 
-        # Status bar is provided by QMainWindow
+        # Status bar — message on left, version label permanently on right
         self.statusBar().showMessage("Ready.")
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setStyleSheet("color: grey; padding-right: 6px;")
+        self.statusBar().addPermanentWidget(version_label)
 
     @staticmethod
     def _folder_row(label: str, edit: QLineEdit, browse_fn) -> QHBoxLayout:
