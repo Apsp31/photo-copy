@@ -35,15 +35,14 @@ Desktop GUI tool to scan a source folder and copy photos and videos into a desti
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - [Pillow](https://pypi.org/project/Pillow/)
-- [tkcalendar](https://pypi.org/project/tkcalendar/)
-- A desktop environment with tkinter support
+- [PySide6](https://pypi.org/project/PySide6/)
 
 ## Installation
 
 ```bash
-pip install Pillow tkcalendar
+pip install PySide6 Pillow
 ```
 
 ## Usage
@@ -73,8 +72,10 @@ If a file at the destination has the same name but is a different file, it is re
 
 | Version | Notes |
 |---------|-------|
+| v5 | GUI refactored from tkinter to PySide6; QThread Signal/Slot threading; tkcalendar removed |
+| v4.2 | 15 reliability, UX and code quality improvements |
 | v4.1 | Fixed UI thread safety, config path, undated video handling, cancel race, bare excepts |
-| v4 | Added video format support and mtime fallback (later removed in v4.1) |
+| v4 | Added video format support |
 | v3 | GUI overhaul |
 | v2 | Duplicate detection improvements |
 | v1 | Initial release |
