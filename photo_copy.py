@@ -33,7 +33,7 @@ from time import time
 
 from PIL import Image
 
-from PySide6.QtCore import QByteArray, QDate, QObject, QThread, Signal
+from PySide6.QtCore import QByteArray, QDate, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -482,10 +482,10 @@ class PhotoOrganizer(QMainWindow):
         # File list (two-column tree)
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Source File", "Target Path"])
-        self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._tree_context_menu)
         vbox.addWidget(self._tree)
 
@@ -705,9 +705,9 @@ class PhotoOrganizer(QMainWindow):
                     f"Needed:    {needed / 1024**2:.1f} MB\n"
                     f"Available: {free   / 1024**2:.1f} MB\n\n"
                     f"Proceed anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
-                if reply == QMessageBox.No:
+                if reply == QMessageBox.StandardButton.No:
                     return
         except OSError:
             pass
