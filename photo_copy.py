@@ -38,10 +38,12 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDateEdit,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -424,6 +426,8 @@ class PhotoOrganizer(QMainWindow):
         self._copy_thread:   QThread | None        = None
         self._scan_worker:   ScanWorker | None     = None
         self._copy_worker:   CopyWorker | None     = None
+        self._profiles:      dict                  = {}   # name → {source, dest, start, end}
+        self._loading_profile = False               # guard against recursive saves
 
         self._build_ui()
         self._load_config()
@@ -436,6 +440,22 @@ class PhotoOrganizer(QMainWindow):
         vbox = QVBoxLayout(root)
         vbox.setSpacing(6)
         vbox.setContentsMargins(10, 10, 10, 6)
+
+        # Profile selector row
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(220)
+        self._profile_combo.currentTextChanged.connect(self._on_profile_selected)
+        profile_row.addWidget(self._profile_combo)
+        save_profile_btn = QPushButton("Save Profile")
+        save_profile_btn.clicked.connect(self._save_profile)
+        profile_row.addWidget(save_profile_btn)
+        delete_profile_btn = QPushButton("Delete Profile")
+        delete_profile_btn.clicked.connect(self._delete_profile)
+        profile_row.addWidget(delete_profile_btn)
+        profile_row.addStretch()
+        vbox.addLayout(profile_row)
 
         # Source / dest folder rows
         self._src_edit = QLineEdit()
@@ -548,6 +568,102 @@ class PhotoOrganizer(QMainWindow):
         except Exception as e:
             log.error("Could not open destination: %s", e)
 
+    # ── Profiles ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _suggest_profile_name(source_path: str) -> str:
+        """
+        Derive a sensible profile name from the source path.
+        Walks up the path components looking for something that looks like a
+        phone/device name (e.g. 'iPhone 14', 'Galaxy S23', 'Pixel 7').
+        Falls back to the last non-empty path component.
+        """
+        parts = [p for p in re.split(r"[\\/]", source_path) if p]
+        _device_hints = re.compile(
+            r"(iphone|ipad|galaxy|pixel|samsung|huawei|oneplus|xiaomi|oppo|sony|nokia|lg|moto)",
+            re.IGNORECASE,
+        )
+        for part in reversed(parts):
+            if _device_hints.search(part):
+                return part
+        return parts[-1] if parts else "New Profile"
+
+    def _populate_profile_combo(self, select_name: str = "") -> None:
+        """Rebuild the combo from self._profiles, optionally selecting select_name."""
+        self._profile_combo.blockSignals(True)
+        self._profile_combo.clear()
+        self._profile_combo.addItem("")          # blank = no profile loaded
+        for name in sorted(self._profiles):
+            self._profile_combo.addItem(name)
+        if select_name:
+            idx = self._profile_combo.findText(select_name)
+            if idx >= 0:
+                self._profile_combo.setCurrentIndex(idx)
+        self._profile_combo.blockSignals(False)
+
+    def _on_profile_selected(self, name: str) -> None:
+        if not name or self._loading_profile:
+            return
+        profile = self._profiles.get(name)
+        if not profile:
+            return
+        self._loading_profile = True
+        try:
+            self._src_edit.setText(profile.get("source_folder", ""))
+            self._dst_edit.setText(profile.get("dest_root_folder", ""))
+            for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
+                val = profile.get(key, "")
+                if val:
+                    try:
+                        d = datetime.strptime(val, "%Y-%m-%d").date()
+                        picker.setDate(QDate(d.year, d.month, d.day))
+                    except ValueError:
+                        pass
+        finally:
+            self._loading_profile = False
+
+    def _save_profile(self) -> None:
+        """Save current fields as a named profile, auto-suggesting a name."""
+        suggested = self._suggest_profile_name(self._src_edit.text().strip())
+        # If a profile is already selected, default to updating it
+        current = self._profile_combo.currentText()
+        if current:
+            suggested = current
+
+        name, ok = QInputDialog.getText(
+            self, "Save Profile", "Profile name:", text=suggested
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        self._profiles[name] = {
+            "source_folder":    self._src_edit.text().strip(),
+            "dest_root_folder": self._dst_edit.text().strip(),
+            "start_date":       self._start_date.date().toString("yyyy-MM-dd"),
+            "end_date":         self._end_date.date().toString("yyyy-MM-dd"),
+        }
+        self._populate_profile_combo(select_name=name)
+        self._save_config()
+        self.statusBar().showMessage(f"Profile '{name}' saved.")
+
+    def _delete_profile(self) -> None:
+        name = self._profile_combo.currentText()
+        if not name:
+            QMessageBox.information(self, "No Profile Selected",
+                                    "Select a profile from the dropdown first.")
+            return
+        reply = QMessageBox.question(
+            self, "Delete Profile",
+            f"Delete profile '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._profiles.pop(name, None)
+            self._populate_profile_combo()
+            self._save_config()
+            self.statusBar().showMessage(f"Profile '{name}' deleted.")
+
     # ── Config ───────────────────────────────────────────────────────
 
     def _load_config(self) -> None:
@@ -556,6 +672,13 @@ class PhotoOrganizer(QMainWindow):
         try:
             with open(self.CONFIG_FILE) as f:
                 cfg = json.load(f)
+
+            # Restore profiles first so the combo is populated before we set fields
+            self._profiles = cfg.get("profiles", {})
+            last_profile   = cfg.get("last_profile", "")
+            self._populate_profile_combo(select_name=last_profile)
+
+            # Restore last-used fields (may be overridden by profile selection above)
             self._src_edit.setText(cfg.get("source_folder", ""))
             self._dst_edit.setText(cfg.get("dest_root_folder", ""))
             for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
@@ -566,6 +689,7 @@ class PhotoOrganizer(QMainWindow):
                         picker.setDate(QDate(d.year, d.month, d.day))
                     except ValueError:
                         pass
+
             geo = cfg.get("geometry", "")
             if geo:
                 try:
@@ -576,12 +700,16 @@ class PhotoOrganizer(QMainWindow):
             log.error("Error loading config: %s", e)
 
     def _save_config(self) -> None:
+        if self._loading_profile:
+            return
         cfg = {
             "source_folder":    self._src_edit.text().strip(),
             "dest_root_folder": self._dst_edit.text().strip(),
             "start_date":       self._start_date.date().toString("yyyy-MM-dd"),
             "end_date":         self._end_date.date().toString("yyyy-MM-dd"),
             "geometry":         self.saveGeometry().toHex().data().decode(),
+            "profiles":         self._profiles,
+            "last_profile":     self._profile_combo.currentText(),
         }
         try:
             with open(self.CONFIG_FILE, "w") as f:
@@ -599,6 +727,13 @@ class PhotoOrganizer(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Source Folder")
         if path:
             self._src_edit.setText(os.path.normpath(path))
+            # Auto-suggest a profile name in the combo if no profile is active
+            if not self._profile_combo.currentText():
+                suggested = self._suggest_profile_name(path)
+                # Just a hint — user still has to click Save Profile
+                self.statusBar().showMessage(
+                    f"Tip: click 'Save Profile' to save this as '{suggested}'"
+                )
             self._save_config()
 
     def _browse_dest(self) -> None:
