@@ -1,241 +1,594 @@
 """
-Photo Organizer (v4)
+Photo Organizer (v5)
 
-Purpose
-- Desktop GUI tool to scan and copy photos and videos from a source folder to a destination library organized by capture date.
+Refactored GUI from tkinter (v4.2) to PySide6.
 
-Key Features
-- Source/destination selection, start/end date filtering (tkcalendar DateEntry)
-- Date extraction from filenames (YYYY-MM-DD / YYYYMMDD) and EXIF for images
-- Undated files (including videos with no filename date) go to <dest>/Undated
-- Duplicate detection (size, mtime, partial MD5 for large files)
-- Multi-threaded copying with live per-file progress and Cancel support
-- Audit log written to destination root, and config.json persistence (next to script)
-- "Open Destination" button to open the output folder after copying
-- Window geometry persisted across sessions
-
-Output Structure
-- Files placed under `<dest>/<year>/<YYYY-MM-DD>`; undated files go to `<dest>/Undated`
+Key changes from v4.2:
+- PySide6 replaces tkinter; tkcalendar dependency removed entirely
+- QThread + Signal/Slot replaces all root.after() workarounds for thread safety
+- Signals emitted from worker threads are automatically queued to the main thread
+- QDateEdit provides a native calendar date picker without third-party packages
+- QStatusBar, QProgressBar, QTreeWidget for a cleaner modern UI
+- Business logic (date parsing, EXIF, hashing, copying) extracted to module-level
+  functions so they can be tested independently of the GUI
 
 Requirements
-- Python 3.8+, Pillow (PIL), tkcalendar, tkinter-enabled desktop environment
-
-Version Notes (v4)
-- Added support for common video formats (.mp4, .mov, .m4v, .avi, .mkv, .mts, .m2ts, .3gp, .wmv, .webm)
-
-Fixes (v4.1)
-- config.json now saved next to the script, not the working directory
-- All tkinter UI updates from background threads dispatched via root.after() for thread safety
-- copy_files now runs in a background thread (no longer freezes the UI)
-- Removed unreliable mtime fallback for videos; undated videos now go to Undated/
-- Cancel flag checked before recording each completed copy future
-- Status update condition guarded against firing when found_files == 0
-- Bare except clauses replaced with except Exception
-
-Improvements (v4.2)
-- Validate start date <= end date before scanning
-- Detect source == destination and abort with a clear error
-- Handle FileNotFoundError gracefully when a file disappears between scan and copy
-- Catch PermissionError and disk-full OSError explicitly during copy; stop run on fatal errors
-- Use public Pillow EXIF API (getexif()) with fallback to _getexif() for older Pillow
-- Add DateTimeDigitized (tag 36868) as secondary EXIF fallback
-- Show current filename in status bar while copying
-- "Open Destination" button opens the output folder in the system file manager
-- Window geometry (size + position) saved to config.json and restored on startup
-- Right-click context menu on tree rows to remove individual files before copying
-- Pre-copy disk space check warns if destination drive lacks sufficient free space
-- threading.Event used for thread-safe cancellation instead of a plain bool
-- Module-level MEDIA_EXTENSIONS / VIDEO_EXTENSIONS frozensets
-- Regex-based filename date parsing replaces character-by-character loops
-- Use logging module instead of print() for all diagnostic output
+- Python 3.10+, PySide6, Pillow  (pip install PySide6 Pillow)
 """
 
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-import hashlib
-import json
+import threading
+from datetime import date as date_type
 from datetime import datetime
 from time import time
+
 from PIL import Image
-import threading
-import concurrent.futures
 
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-except ModuleNotFoundError:
-    print("Error: tkinter module is not available in this environment.")
-    print("Please install it or run this script in a desktop environment that supports tkinter.")
-    sys.exit(1)
-
-from tkcalendar import DateEntry
+from PySide6.QtCore import QByteArray, QDate, QObject, Qt, QThread, Signal
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDateEdit,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
+APP_VERSION = "5.4.0"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Supported file extensions
-VIDEO_EXTENSIONS: frozenset = frozenset({
-    '.mp4', '.mov', '.m4v', '.avi', '.mkv', '.mts', '.m2ts',
-    '.3gp', '.wmv', '.webm',
+# ---------------------------------------------------------------------------
+# File-type constants
+# ---------------------------------------------------------------------------
+
+VIDEO_EXTENSIONS: frozenset[str] = frozenset({
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts",
+    ".3gp", ".wmv", ".webm",
 })
-MEDIA_EXTENSIONS: frozenset = frozenset({
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
-    '.heic', '.raw', '.cr2', '.nef', '.dng', '.arw', '.orf',
+MEDIA_EXTENSIONS: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+    ".heic", ".raw", ".cr2", ".nef", ".dng", ".arw", ".orf",
 }) | VIDEO_EXTENSIONS
 
 # EXIF tag IDs (checked in priority order)
-_EXIF_DATETIME_ORIGINAL   = 36867  # DateTimeOriginal
-_EXIF_DATETIME_DIGITIZED  = 36868  # DateTimeDigitized
-_EXIF_DATETIME            = 306    # DateTime
+_EXIF_DATETIME_ORIGINAL  = 36867  # DateTimeOriginal
+_EXIF_DATETIME_DIGITIZED = 36868  # DateTimeDigitized
+_EXIF_DATETIME           = 306    # DateTime
 
-# Regex patterns for date extraction from filenames (priority: dashed > compact)
-_RE_DATE_DASHED  = re.compile(r'(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)')
-_RE_DATE_COMPACT = re.compile(r'(?<!\d)(\d{8})(?!\d)')
+# Regex patterns for date extraction from filenames
+_RE_DATE_DASHED  = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+_RE_DATE_COMPACT = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 
 
-class PhotoOrganizer:
+# ---------------------------------------------------------------------------
+# Framework-agnostic business logic
+# ---------------------------------------------------------------------------
+
+def get_exif_date(file_path: str) -> datetime | None:
+    """Return the capture datetime from EXIF, or None if unavailable."""
+    try:
+        with Image.open(file_path) as image:
+            try:
+                exif_data = image.getexif()          # Pillow 8.2+ public API
+            except AttributeError:
+                exif_data = image._getexif() or {}   # fallback for older Pillow
+            for tag_id in (_EXIF_DATETIME_ORIGINAL, _EXIF_DATETIME_DIGITIZED, _EXIF_DATETIME):
+                raw = exif_data.get(tag_id)
+                if raw:
+                    try:
+                        return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        log.warning("Malformed EXIF date '%s' in %s", raw, file_path)
+    except Exception:
+        pass
+    return None
+
+
+def get_file_date(file_path: str) -> datetime | None:
+    """
+    Return a capture date for the file using (in priority order):
+      1. YYYY-MM-DD pattern in filename stem
+      2. YYYYMMDD pattern in filename stem
+      3. EXIF data (images only; videos go to Undated/ if no filename date)
+    Returns None if no reliable date is found.
+    mtime is intentionally excluded: it changes on copy and cannot be trusted.
+    """
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+
+    for match in _RE_DATE_DASHED.finditer(stem):
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d")
+        except ValueError:
+            pass
+
+    for match in _RE_DATE_COMPACT.finditer(stem):
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d")
+        except ValueError:
+            pass
+
+    if os.path.splitext(file_path)[1].lower() not in VIDEO_EXTENSIONS:
+        return get_exif_date(file_path)
+
+    return None
+
+
+def files_are_identical(f1: str, f2: str) -> bool:
+    """
+    True if f1 and f2 have identical content.
+    Uses a staged approach: size → mtime → full read (small) → partial MD5 (large).
+    """
+    try:
+        s1, s2 = os.stat(f1), os.stat(f2)
+        if s1.st_size != s2.st_size:
+            return False
+        if s1.st_mtime == s2.st_mtime:
+            return True
+        if s1.st_size < 8192:
+            with open(f1, "rb") as a, open(f2, "rb") as b:
+                return a.read() == b.read()
+
+        BLOCK = 2 * 1024 * 1024
+
+        def partial_hash(path: str, size: int) -> bytes:
+            h = hashlib.md5()
+            with open(path, "rb") as fh:
+                h.update(fh.read(BLOCK))
+                if size > BLOCK * 3:
+                    fh.seek(size // 2)
+                    h.update(fh.read(BLOCK))
+                    fh.seek(-BLOCK, 2)
+                    h.update(fh.read(BLOCK))
+            return h.digest()
+
+        return partial_hash(f1, s1.st_size) == partial_hash(f2, s1.st_size)
+    except (OSError, IOError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Worker: Scan
+# ---------------------------------------------------------------------------
+
+class ScanWorker(QObject):
+    """
+    Scans source recursively for media files and determines destination paths.
+    Runs in a QThread; communicates with the UI exclusively via signals.
+    """
+    status_changed   = Signal(str)
+    progress_changed = Signal(int)
+    batch_ready      = Signal(list)   # list of (src_path, dst_path) tuples
+    scan_stats       = Signal(dict)   # emitted just before finished with summary stats
+    finished         = Signal()
+
+    def __init__(
+        self,
+        source: str,
+        dest: str,
+        start_date: date_type,
+        end_date: date_type,
+        dir_cache: dict,
+    ):
+        super().__init__()
+        self.source     = source
+        self.dest       = dest
+        self.start_date = start_date
+        self.end_date   = end_date
+        self._dir_cache = dir_cache
+        self._cancel    = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def _find_matching_folder(self, date: datetime) -> str | None:
+        year_path = os.path.join(self.dest, str(date.year))
+        if not os.path.exists(year_path):
+            return None
+        if year_path not in self._dir_cache:
+            try:
+                self._dir_cache[year_path] = [
+                    e.name for e in os.scandir(year_path) if e.is_dir()
+                ]
+            except OSError:
+                return None
+        prefix = date.strftime("%Y-%m-%d")
+        for entry in self._dir_cache[year_path]:
+            if entry.startswith(prefix):
+                return os.path.join(year_path, entry)
+        return None
+
+    def run(self) -> None:
+        start_time    = time()
+        to_copy       = 0
+        duplicates    = 0
+        undated       = 0
+        out_of_range  = 0
+        found_files   = 0
+        scanned_count = 0
+
+        def scan_dir(path: str):
+            try:
+                with os.scandir(path) as it:
+                    files, dirs = [], []
+                    for e in it:
+                        if e.is_file():
+                            files.append(e.name)
+                        elif e.is_dir():
+                            dirs.append(e.path)
+                    return files, dirs
+            except OSError:
+                return [], []
+
+        dirs_to_scan = [self.source]
+        batch: list  = []
+
+        while dirs_to_scan:
+            if self._cancel.is_set():
+                self.status_changed.emit("Operation cancelled.")
+                self.finished.emit()
+                return
+
+            current_dir    = dirs_to_scan.pop()
+            files, subdirs = scan_dir(current_dir)
+            dirs_to_scan.extend(subdirs)
+            found_files += len(files)
+
+            for file in files:
+                if self._cancel.is_set():
+                    self.status_changed.emit("Operation cancelled.")
+                    self.finished.emit()
+                    return
+
+                scanned_count += 1
+                if os.path.splitext(file)[1].lower() not in MEDIA_EXTENSIONS:
+                    continue
+
+                fp   = os.path.normpath(os.path.join(current_dir, file))
+                date = get_file_date(fp)
+
+                if date is None:
+                    undated += 1
+                elif not (self.start_date <= date.date() <= self.end_date):
+                    out_of_range += 1
+                    continue
+
+                if date:
+                    year_folder = os.path.normpath(os.path.join(self.dest, str(date.year)))
+                    date_folder = self._find_matching_folder(date) or os.path.normpath(
+                        os.path.join(year_folder, date.strftime("%Y-%m-%d"))
+                    )
+                else:
+                    date_folder = os.path.normpath(os.path.join(self.dest, "Undated"))
+
+                dst = os.path.normpath(os.path.join(date_folder, file))
+
+                if os.path.exists(dst):
+                    try:
+                        if (
+                            os.path.getsize(fp) == os.path.getsize(dst)
+                            and files_are_identical(fp, dst)
+                        ):
+                            duplicates += 1
+                            continue
+                        base, ext = os.path.splitext(dst)
+                        n = 1
+                        while os.path.exists(dst):
+                            dst = os.path.normpath(f"{base}_{n}{ext}")
+                            n += 1
+                    except OSError:
+                        pass
+
+                batch.append((fp, dst))
+                to_copy += 1
+
+                if len(batch) >= 50:
+                    self.batch_ready.emit(list(batch))
+                    batch.clear()
+                    self.progress_changed.emit(
+                        int(scanned_count / max(found_files, 1) * 100)
+                    )
+                    self.status_changed.emit(
+                        f"Scanning… {scanned_count}/{found_files} files · "
+                        f"{to_copy} to copy"
+                    )
+
+            if found_files > 0 and found_files % 500 == 0:
+                self.status_changed.emit(
+                    f"Found {found_files} files, {to_copy} to copy…"
+                )
+
+        if batch:
+            self.batch_ready.emit(list(batch))
+
+        elapsed = time() - start_time
+        stats = {
+            "scanned":      scanned_count,
+            "to_copy":      to_copy,
+            "duplicates":   duplicates,
+            "undated":      undated,
+            "out_of_range": out_of_range,
+            "elapsed":      elapsed,
+        }
+        self.scan_stats.emit(stats)
+        self.finished.emit()
+
+
+# ---------------------------------------------------------------------------
+# Worker: Copy
+# ---------------------------------------------------------------------------
+
+class CopyWorker(QObject):
+    """
+    Copies a list of (src, dst) pairs using a thread pool.
+    Runs in a QThread; communicates with the UI exclusively via signals.
+    """
+    status_changed   = Signal(str)
+    progress_changed = Signal(int)
+    fatal_error      = Signal(str, str)                        # title, message
+    finished         = Signal(int, float, object, bool)        # copied, elapsed, audit_log, cancelled
+
+    def __init__(self, files_to_copy: list[tuple[str, str]], dest: str):
+        super().__init__()
+        self.files_to_copy = files_to_copy
+        self.dest          = dest
+        self._cancel       = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @staticmethod
+    def _copy_one(src: str, dst: str) -> None:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    def run(self) -> None:
+        total       = len(self.files_to_copy)
+        audit_log: dict[str, list[str]] = {}
+        copied      = 0
+        start_time  = time()
+        max_workers = min(10, os.cpu_count() or 4)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(self._copy_one, src, dst): (src, dst)
+                for src, dst in self.files_to_copy
+            }
+            for future in concurrent.futures.as_completed(futures):
+                if self._cancel.is_set():
+                    self.status_changed.emit("Operation cancelled.")
+                    self.finished.emit(copied, time() - start_time, audit_log, True)
+                    return
+
+                src, dst = futures[future]
+                try:
+                    future.result()
+                    copied += 1
+                    audit_log.setdefault(os.path.dirname(dst), []).append(
+                        os.path.basename(dst)
+                    )
+                    if copied % 5 == 0 or copied == total:
+                        self.progress_changed.emit(int(copied / total * 100))
+                    self.status_changed.emit(
+                        f"Copying {os.path.basename(src)} ({copied}/{total})"
+                    )
+                except FileNotFoundError:
+                    log.warning("Source not found, skipped: %s", src)
+                except PermissionError as e:
+                    log.error("Permission denied: %s — %s", src, e)
+                    self.fatal_error.emit(
+                        "Permission Error",
+                        f"Permission denied:\n{src}\n\nCopy stopped.",
+                    )
+                    self.finished.emit(copied, time() - start_time, audit_log, False)
+                    return
+                except OSError as e:
+                    log.error("OS error copying %s: %s", src, e)
+                    self.fatal_error.emit(
+                        "Copy Error",
+                        f"Failed to copy:\n{src}\n\n{e}\n\nCopy stopped.",
+                    )
+                    self.finished.emit(copied, time() - start_time, audit_log, False)
+                    return
+                except Exception as e:
+                    log.error("Unexpected error copying %s: %s", src, e)
+
+        self.finished.emit(copied, time() - start_time, audit_log, False)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class PhotoOrganizer(QMainWindow):
     CONFIG_FILE = os.path.join(_SCRIPT_DIR, "config.json")
 
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Photo Organizer")
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"Photo Organizer v{APP_VERSION}")
+        self.resize(960, 660)
 
-        self.source_folder    = tk.StringVar()
-        self.dest_root_folder = tk.StringVar()
-        self.status_text      = tk.StringVar(value="Ready.")
-        self._cancel_event    = threading.Event()  # thread-safe cancellation
-        self._dir_cache: dict = {}
+        self._files_to_copy:   list[tuple[str, str]] = []
+        self._dir_cache:       dict                  = {}
+        self._scan_thread:     QThread | None        = None
+        self._copy_thread:     QThread | None        = None
+        self._scan_worker:     ScanWorker | None     = None
+        self._copy_worker:     CopyWorker | None     = None
+        self._profiles:        dict                  = {}   # name → {source, dest, start, end}
+        self._loading_profile: bool                  = False
+        self._last_scan_stats: dict                  = {}
 
-        self.setup_gui()
-        self.files_to_copy: list = []
-        self.load_config()
+        # Sync All state
+        self._sync_all_active: bool       = False
+        self._sync_all_queue:  list[str]  = []
 
-    # ------------------------------------------------------------------
-    # Thread-safe UI helpers
-    # ------------------------------------------------------------------
+        self._build_ui()
+        self._load_config()
 
-    def _ui(self, fn):
-        """Schedule fn() to run on the main tkinter thread."""
-        self.root.after(0, fn)
+    # ── UI construction ──────────────────────────────────────────────
 
-    def _ui_status(self, msg: str):
-        self._ui(lambda: self.status_text.set(msg))
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        vbox = QVBoxLayout(root)
+        vbox.setSpacing(6)
+        vbox.setContentsMargins(10, 10, 10, 6)
 
-    def _ui_progress(self, val: float):
-        self._ui(lambda: self.progress.configure(value=val))
+        # Profile selector row
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(220)
+        self._profile_combo.currentTextChanged.connect(self._on_profile_selected)
+        profile_row.addWidget(self._profile_combo)
+        save_profile_btn = QPushButton("Save Profile")
+        save_profile_btn.clicked.connect(self._save_profile)
+        profile_row.addWidget(save_profile_btn)
+        delete_profile_btn = QPushButton("Delete Profile")
+        delete_profile_btn.clicked.connect(self._delete_profile)
+        profile_row.addWidget(delete_profile_btn)
+        profile_row.addStretch()
+        vbox.addLayout(profile_row)
 
-    def _ui_button(self, button, state):
-        self._ui(lambda b=button, s=state: b.config(state=s))
+        # Source / dest folder rows
+        self._src_edit = QLineEdit()
+        self._dst_edit = QLineEdit()
+        vbox.addLayout(self._folder_row("Source Folder:", self._src_edit, self._browse_source))
+        vbox.addLayout(self._folder_row("Destination Folder:", self._dst_edit, self._browse_dest))
 
-    def _ui_tree_insert(self, rows: list):
-        def _insert(r=rows):
-            for src, dst in r:
-                self.tree.insert("", "end", values=(src, dst))
-        self._ui(_insert)
+        # Date filter row
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel("Start Date:"))
+        self._start_date = QDateEdit(QDate.currentDate())
+        self._start_date.setCalendarPopup(True)
+        self._start_date.setDisplayFormat("yyyy-MM-dd")
+        date_row.addWidget(self._start_date)
+        date_row.addSpacing(20)
+        date_row.addWidget(QLabel("End Date:"))
+        self._end_date = QDateEdit(QDate.currentDate())
+        self._end_date.setCalendarPopup(True)
+        self._end_date.setDisplayFormat("yyyy-MM-dd")
+        date_row.addWidget(self._end_date)
+        date_row.addStretch()
+        vbox.addLayout(date_row)
 
-    def _ui_tree_clear(self):
-        self._ui(lambda: self.tree.delete(*self.tree.get_children()))
+        # Action buttons
+        btn_row = QHBoxLayout()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel_operation)
+        btn_row.addWidget(self._cancel_btn)
 
-    def _ui_show_info(self, title: str, msg: str):
-        self._ui(lambda t=title, m=msg: messagebox.showinfo(t, m))
+        self._scan_btn = QPushButton("Scan for Files")
+        self._scan_btn.clicked.connect(self._scan_files)
+        btn_row.addWidget(self._scan_btn)
 
-    def _ui_show_error(self, title: str, msg: str):
-        self._ui(lambda t=title, m=msg: messagebox.showerror(t, m))
+        self._copy_btn = QPushButton("Copy Files")
+        self._copy_btn.clicked.connect(self._copy_files)
+        btn_row.addWidget(self._copy_btn)
 
-    # ------------------------------------------------------------------
-    # GUI setup
-    # ------------------------------------------------------------------
+        self._sync_all_btn = QPushButton("Sync All Profiles")
+        self._sync_all_btn.clicked.connect(self._sync_all)
+        btn_row.addWidget(self._sync_all_btn)
 
-    def setup_gui(self):
-        tk.Label(self.root, text="Source Folder:").grid(row=0, column=0, sticky='e')
-        tk.Entry(self.root, textvariable=self.source_folder, width=50).grid(row=0, column=1)
-        tk.Button(self.root, text="Browse", command=self.browse_source).grid(row=0, column=2)
+        open_btn = QPushButton("Open Destination")
+        open_btn.clicked.connect(self._open_destination)
+        btn_row.addWidget(open_btn)
+        vbox.addLayout(btn_row)
 
-        tk.Label(self.root, text="Destination Root Folder:").grid(row=1, column=0, sticky='e')
-        tk.Entry(self.root, textvariable=self.dest_root_folder, width=50).grid(row=1, column=1)
-        tk.Button(self.root, text="Browse", command=self.browse_dest_root).grid(row=1, column=2)
+        # File list (two-column tree)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Source File", "Target Path"])
+        self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._tree_context_menu)
+        vbox.addWidget(self._tree)
 
-        # Action buttons row
-        self.cancel_button = tk.Button(
-            self.root, text="Cancel",
-            command=self.cancel_current_operation, state=tk.DISABLED,
-        )
-        self.cancel_button.grid(row=2, column=0, pady=10)
-        tk.Button(self.root, text="Scan for Files", command=self.scan_files).grid(row=2, column=1, pady=10)
-        tk.Button(self.root, text="Copy Files", command=self.copy_files).grid(row=2, column=2, pady=10)
+        # Scan stats bar — shown after each scan
+        self._stats_label = QLabel("")
+        self._stats_label.setStyleSheet("color: #555; font-size: 11px; padding: 2px 0;")
+        vbox.addWidget(self._stats_label)
 
-        # File list
-        self.tree = ttk.Treeview(self.root, columns=("Source", "Target"), show='headings')
-        self.tree.heading("Source", text="Source File")
-        self.tree.heading("Target", text="Target Path")
-        self.tree.grid(row=3, column=0, columnspan=3, sticky='nsew')
-        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        # Progress bar
+        self._progress = QProgressBar()
+        self._progress.setValue(0)
+        vbox.addWidget(self._progress)
 
-        # Right-click context menu
-        self._tree_menu = tk.Menu(self.root, tearoff=0)
-        self._tree_menu.add_command(label="Remove from list", command=self._remove_selected_tree_items)
+        # Status bar — message on left, version label permanently on right
+        self.statusBar().showMessage("Ready.")
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setStyleSheet("color: grey; padding-right: 6px;")
+        self.statusBar().addPermanentWidget(version_label)
 
-        # Progress + status
-        self.progress = ttk.Progressbar(self.root, mode='determinate')
-        self.progress.grid(row=4, column=0, columnspan=3, sticky='we', pady=(5, 0))
+    @staticmethod
+    def _folder_row(label: str, edit: QLineEdit, browse_fn) -> QHBoxLayout:
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        lbl.setFixedWidth(130)
+        row.addWidget(lbl)
+        row.addWidget(edit)
+        btn = QPushButton("Browse…")
+        btn.setFixedWidth(80)
+        btn.clicked.connect(browse_fn)
+        row.addWidget(btn)
+        return row
 
-        self.status_label = tk.Label(self.root, textvariable=self.status_text, anchor='w')
-        self.status_label.grid(row=5, column=0, columnspan=3, sticky='we', pady=(2, 2))
+    # ── Context menu ─────────────────────────────────────────────────
 
-        # Date pickers
-        tk.Label(self.root, text="Start Date:").grid(row=6, column=0, sticky='e')
-        self.start_date_picker = DateEntry(self.root, width=20, date_pattern="yyyy-MM-dd")
-        self.start_date_picker.grid(row=6, column=1, sticky='w')
+    def _tree_context_menu(self, pos) -> None:
+        if not self._tree.selectedItems():
+            return
+        menu = QMenu(self)
+        action = QAction("Remove from list", self)
+        action.triggered.connect(self._remove_selected)
+        menu.addAction(action)
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
 
-        tk.Label(self.root, text="End Date:").grid(row=7, column=0, sticky='e')
-        self.end_date_picker = DateEntry(self.root, width=20, date_pattern="yyyy-MM-dd")
-        self.end_date_picker.grid(row=7, column=1, sticky='w')
-
-        # Open destination button
-        tk.Button(
-            self.root, text="Open Destination",
-            command=self.open_destination,
-        ).grid(row=7, column=2, pady=5, sticky='e')
-
-        self.root.grid_rowconfigure(3, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-
-        # Persist window geometry on close
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ------------------------------------------------------------------
-    # Tree right-click
-    # ------------------------------------------------------------------
-
-    def _on_tree_right_click(self, event):
-        row = self.tree.identify_row(event.y)
-        if row:
-            self.tree.selection_set(row)
-            self._tree_menu.post(event.x_root, event.y_root)
-
-    def _remove_selected_tree_items(self):
-        selected = self.tree.selection()
+    def _remove_selected(self) -> None:
+        selected = self._tree.selectedItems()
+        srcs     = {item.text(0) for item in selected}
+        root     = self._tree.invisibleRootItem()
         for item in selected:
-            values = self.tree.item(item, "values")
-            src = values[0]
-            self.files_to_copy = [(s, d) for s, d in self.files_to_copy if s != src]
-            self.tree.delete(item)
-        self._ui_status(f"{len(self.files_to_copy)} files ready to copy.")
+            root.removeChild(item)
+        self._files_to_copy = [(s, d) for s, d in self._files_to_copy if s not in srcs]
+        self.statusBar().showMessage(f"{len(self._files_to_copy)} files ready to copy.")
 
-    # ------------------------------------------------------------------
-    # Open destination
-    # ------------------------------------------------------------------
+    # ── Open destination ─────────────────────────────────────────────
 
-    def open_destination(self):
-        dst = self.dest_root_folder.get()
+    def _open_destination(self) -> None:
+        dst = self._dst_edit.text().strip()
         if not dst or not os.path.isdir(dst):
-            messagebox.showwarning("No Destination", "Please select a valid destination folder first.")
+            QMessageBox.warning(self, "No Destination",
+                                "Please select a valid destination folder first.")
             return
         try:
             if sys.platform == "win32":
@@ -245,487 +598,500 @@ class PhotoOrganizer:
             else:
                 subprocess.run(["xdg-open", dst])
         except Exception as e:
-            log.error("Could not open destination folder: %s", e)
+            log.error("Could not open destination: %s", e)
 
-    # ------------------------------------------------------------------
-    # Config persistence
-    # ------------------------------------------------------------------
+    # ── Profiles ─────────────────────────────────────────────────────
 
-    def load_config(self):
-        if os.path.exists(self.CONFIG_FILE):
-            try:
-                with open(self.CONFIG_FILE, 'r') as f:
-                    config = json.load(f)
-                self.source_folder.set(config.get("source_folder", ""))
-                self.dest_root_folder.set(config.get("dest_root_folder", ""))
-                try:
-                    start_date = config.get("start_date", "")
-                    if start_date:
-                        self.start_date_picker.set_date(datetime.strptime(start_date, "%Y-%m-%d").date())
-                except (ValueError, KeyError):
-                    pass
-                try:
-                    end_date = config.get("end_date", "")
-                    if end_date:
-                        self.end_date_picker.set_date(datetime.strptime(end_date, "%Y-%m-%d").date())
-                except (ValueError, KeyError):
-                    pass
-                geometry = config.get("geometry", "")
-                if geometry:
+    @staticmethod
+    def _suggest_profile_name(source_path: str) -> str:
+        parts = [p for p in re.split(r"[\\/]", source_path) if p]
+        _device_hints = re.compile(
+            r"(iphone|ipad|galaxy|pixel|samsung|huawei|oneplus|xiaomi|oppo|sony|nokia|lg|moto)",
+            re.IGNORECASE,
+        )
+        for part in reversed(parts):
+            if _device_hints.search(part):
+                return part
+        return parts[-1] if parts else "New Profile"
+
+    def _populate_profile_combo(self, select_name: str = "") -> None:
+        self._profile_combo.blockSignals(True)
+        self._profile_combo.clear()
+        self._profile_combo.addItem("")
+        for name in sorted(self._profiles):
+            self._profile_combo.addItem(name)
+        if select_name:
+            idx = self._profile_combo.findText(select_name)
+            if idx >= 0:
+                self._profile_combo.setCurrentIndex(idx)
+        self._profile_combo.blockSignals(False)
+
+    def _on_profile_selected(self, name: str) -> None:
+        if not name or self._loading_profile:
+            return
+        profile = self._profiles.get(name)
+        if not profile:
+            return
+        self._loading_profile = True
+        try:
+            self._src_edit.setText(profile.get("source_folder", ""))
+            self._dst_edit.setText(profile.get("dest_root_folder", ""))
+            for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
+                val = profile.get(key, "")
+                if val:
                     try:
-                        self.root.geometry(geometry)
-                    except Exception:
+                        d = datetime.strptime(val, "%Y-%m-%d").date()
+                        picker.setDate(QDate(d.year, d.month, d.day))
+                    except ValueError:
                         pass
-            except Exception as e:
-                log.error("Error loading config: %s", e)
+        finally:
+            self._loading_profile = False
 
-    def save_config(self):
-        config = {
-            "source_folder":   self.source_folder.get(),
-            "dest_root_folder": self.dest_root_folder.get(),
-            "start_date":      self.start_date_picker.get_date().strftime("%Y-%m-%d"),
-            "end_date":        self.end_date_picker.get_date().strftime("%Y-%m-%d"),
-            "geometry":        self.root.geometry(),
+    def _save_profile(self) -> None:
+        suggested = self._suggest_profile_name(self._src_edit.text().strip())
+        current   = self._profile_combo.currentText()
+        if current:
+            suggested = current
+        name, ok = QInputDialog.getText(
+            self, "Save Profile", "Profile name:", text=suggested
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self._profiles[name] = {
+            "source_folder":    self._src_edit.text().strip(),
+            "dest_root_folder": self._dst_edit.text().strip(),
+            "start_date":       self._start_date.date().toString("yyyy-MM-dd"),
+            "end_date":         self._end_date.date().toString("yyyy-MM-dd"),
+        }
+        self._populate_profile_combo(select_name=name)
+        self._save_config()
+        self.statusBar().showMessage(f"Profile '{name}' saved.")
+
+    def _delete_profile(self) -> None:
+        name = self._profile_combo.currentText()
+        if not name:
+            QMessageBox.information(self, "No Profile Selected",
+                                    "Select a profile from the dropdown first.")
+            return
+        reply = QMessageBox.question(
+            self, "Delete Profile",
+            f"Delete profile '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._profiles.pop(name, None)
+            self._populate_profile_combo()
+            self._save_config()
+            self.statusBar().showMessage(f"Profile '{name}' deleted.")
+
+    def _advance_profile_start_date(self, profile_name: str) -> None:
+        """
+        After a successful copy, move the profile's start_date to today so the
+        next sync automatically covers only new photos.
+        """
+        if not profile_name or profile_name not in self._profiles:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._profiles[profile_name]["start_date"] = today
+        # Update the picker live if this profile is still selected
+        if self._profile_combo.currentText() == profile_name:
+            self._loading_profile = True
+            try:
+                d = datetime.now().date()
+                self._start_date.setDate(QDate(d.year, d.month, d.day))
+            finally:
+                self._loading_profile = False
+        self._save_config()
+        log.info("Advanced start date for profile '%s' to %s", profile_name, today)
+
+    # ── Config ───────────────────────────────────────────────────────
+
+    def _load_config(self) -> None:
+        if not os.path.exists(self.CONFIG_FILE):
+            return
+        try:
+            with open(self.CONFIG_FILE) as f:
+                cfg = json.load(f)
+            self._profiles    = cfg.get("profiles", {})
+            last_profile      = cfg.get("last_profile", "")
+            self._populate_profile_combo(select_name=last_profile)
+            self._src_edit.setText(cfg.get("source_folder", ""))
+            self._dst_edit.setText(cfg.get("dest_root_folder", ""))
+            for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
+                val = cfg.get(key, "")
+                if val:
+                    try:
+                        d = datetime.strptime(val, "%Y-%m-%d").date()
+                        picker.setDate(QDate(d.year, d.month, d.day))
+                    except ValueError:
+                        pass
+            geo = cfg.get("geometry", "")
+            if geo:
+                try:
+                    self.restoreGeometry(QByteArray.fromHex(geo.encode()))
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error("Error loading config: %s", e)
+
+    def _save_config(self) -> None:
+        if self._loading_profile:
+            return
+        cfg = {
+            "source_folder":    self._src_edit.text().strip(),
+            "dest_root_folder": self._dst_edit.text().strip(),
+            "start_date":       self._start_date.date().toString("yyyy-MM-dd"),
+            "end_date":         self._end_date.date().toString("yyyy-MM-dd"),
+            "geometry":         self.saveGeometry().toHex().data().decode(),
+            "profiles":         self._profiles,
+            "last_profile":     self._profile_combo.currentText(),
         }
         try:
-            with open(self.CONFIG_FILE, 'w') as f:
-                json.dump(config, f, indent=2)
+            with open(self.CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
         except Exception as e:
             log.error("Error saving config: %s", e)
 
-    def _on_close(self):
-        self.save_config()
-        self.root.destroy()
+    def closeEvent(self, event) -> None:
+        self._save_config()
+        super().closeEvent(event)
 
-    def browse_source(self):
-        path = filedialog.askdirectory()
+    # ── Browse ───────────────────────────────────────────────────────
+
+    def _browse_source(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Source Folder")
         if path:
-            self.source_folder.set(os.path.normpath(path))
-            self.save_config()
+            self._src_edit.setText(os.path.normpath(path))
+            if not self._profile_combo.currentText():
+                suggested = self._suggest_profile_name(path)
+                self.statusBar().showMessage(
+                    f"Tip: click 'Save Profile' to save this as '{suggested}'"
+                )
+            self._save_config()
 
-    def browse_dest_root(self):
-        path = filedialog.askdirectory()
+    def _browse_dest(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
         if path:
-            self.dest_root_folder.set(os.path.normpath(path))
-            self.save_config()
+            self._dst_edit.setText(os.path.normpath(path))
+            self._save_config()
 
-    # ------------------------------------------------------------------
-    # Date extraction
-    # ------------------------------------------------------------------
+    # ── Validation ───────────────────────────────────────────────────
 
-    def get_exif_date(self, file_path: str) -> datetime | None:
-        """Extract capture date from image EXIF. Returns None if unavailable."""
-        try:
-            with Image.open(file_path) as image:
-                # Use public API (Pillow 8.2+) with fallback to private _getexif
-                try:
-                    exif_data = image.getexif()
-                except AttributeError:
-                    exif_data = image._getexif() or {}
-
-                for tag_id in (_EXIF_DATETIME_ORIGINAL, _EXIF_DATETIME_DIGITIZED, _EXIF_DATETIME):
-                    raw = exif_data.get(tag_id)
-                    if raw:
-                        try:
-                            return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
-                        except ValueError:
-                            log.warning("Malformed EXIF date '%s' in %s", raw, file_path)
-        except Exception:
-            pass
-        return None
-
-    def get_file_date(self, file_path: str) -> datetime | None:
-        """
-        Return a capture date for the file using (in order):
-          1. YYYY-MM-DD pattern anywhere in the filename
-          2. YYYYMMDD pattern anywhere in the filename
-          3. EXIF data (images only)
-        Returns None if no reliable date is found.
-        """
-        filename = os.path.basename(file_path)
-        stem = os.path.splitext(filename)[0]
-
-        # 1. YYYY-MM-DD in filename
-        for match in _RE_DATE_DASHED.finditer(stem):
-            try:
-                return datetime.strptime(match.group(1), "%Y-%m-%d")
-            except ValueError:
-                pass
-
-        # 2. YYYYMMDD in filename
-        for match in _RE_DATE_COMPACT.finditer(stem):
-            try:
-                return datetime.strptime(match.group(1), "%Y%m%d")
-            except ValueError:
-                pass
-
-        # 3. EXIF fallback for images only
-        if os.path.splitext(filename)[1].lower() not in VIDEO_EXTENSIONS:
-            date = self.get_exif_date(file_path)
-            if date:
-                return date
-
-        # No reliable date — caller routes to Undated/
-        # mtime intentionally excluded: it changes on file copy
-        return None
-
-    # ------------------------------------------------------------------
-    # Duplicate detection
-    # ------------------------------------------------------------------
-
-    def files_are_identical(self, f1: str, f2: str) -> bool:
-        try:
-            stat1 = os.stat(f1)
-            stat2 = os.stat(f2)
-            if stat1.st_size != stat2.st_size:
-                return False
-            if stat1.st_mtime == stat2.st_mtime:
-                return True
-            if stat1.st_size < 8192:
-                with open(f1, 'rb') as file1, open(f2, 'rb') as file2:
-                    return file1.read() == file2.read()
-
-            def smart_partial_hash(path, file_size, blocksize=2 * 1024 * 1024):
-                hasher = hashlib.md5()
-                with open(path, 'rb') as afile:
-                    hasher.update(afile.read(blocksize))
-                    if file_size > blocksize * 3:
-                        afile.seek(file_size // 2)
-                        hasher.update(afile.read(blocksize))
-                        afile.seek(-blocksize, 2)
-                        hasher.update(afile.read(blocksize))
-                return hasher.digest()
-
-            return smart_partial_hash(f1, stat1.st_size) == smart_partial_hash(f2, stat1.st_size)
-        except (OSError, IOError):
-            return False
-
-    # ------------------------------------------------------------------
-    # Path helpers
-    # ------------------------------------------------------------------
-
-    def validate_paths(self) -> bool:
-        src = self.source_folder.get()
-        dst = self.dest_root_folder.get()
+    def _validate_paths(self) -> bool:
+        src = self._src_edit.text().strip()
+        dst = self._dst_edit.text().strip()
         if not os.path.isdir(src):
-            messagebox.showerror("Invalid Source", "The selected source folder does not exist.")
+            QMessageBox.critical(self, "Invalid Source",
+                                 "The selected source folder does not exist.")
             return False
         if not os.path.isdir(dst):
-            messagebox.showerror("Invalid Destination", "The selected destination folder does not exist.")
+            QMessageBox.critical(self, "Invalid Destination",
+                                 "The selected destination folder does not exist.")
             return False
         try:
             if os.path.samefile(src, dst):
-                messagebox.showerror(
-                    "Invalid Paths",
-                    "Source and destination cannot be the same folder.",
-                )
+                QMessageBox.critical(self, "Invalid Paths",
+                                     "Source and destination cannot be the same folder.")
                 return False
         except OSError:
             pass
         return True
 
-    def find_matching_folder(self, date: datetime) -> str | None:
-        year_path = os.path.join(self.dest_root_folder.get(), str(date.year))
-        if not os.path.exists(year_path):
-            return None
-        if year_path not in self._dir_cache:
-            try:
-                self._dir_cache[year_path] = [e.name for e in os.scandir(year_path) if e.is_dir()]
-            except OSError:
-                return None
-        prefix = date.strftime("%Y-%m-%d")
-        for entry in self._dir_cache[year_path]:
-            if entry.startswith(prefix):
-                return os.path.join(year_path, entry)
-        return None
+    def _validate_dates(self) -> bool:
+        if self._start_date.date() > self._end_date.date():
+            QMessageBox.critical(self, "Invalid Date Range",
+                                 "Start date must be on or before end date.")
+            return False
+        return True
 
-    # ------------------------------------------------------------------
-    # File type checks
-    # ------------------------------------------------------------------
+    # ── Button state ─────────────────────────────────────────────────
 
-    @staticmethod
-    def is_media_file(filename: str) -> bool:
-        return os.path.splitext(filename)[1].lower() in MEDIA_EXTENSIONS
+    def _set_busy(self, busy: bool) -> None:
+        self._cancel_btn.setEnabled(busy)
+        self._scan_btn.setEnabled(not busy)
+        self._copy_btn.setEnabled(not busy)
+        self._sync_all_btn.setEnabled(not busy)
 
-    @staticmethod
-    def is_video_file(filename: str) -> bool:
-        return os.path.splitext(filename)[1].lower() in VIDEO_EXTENSIONS
+    # ── Scan ─────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Scan
-    # ------------------------------------------------------------------
+    def _scan_files(self) -> None:
+        if not self._validate_paths() or not self._validate_dates():
+            return
+        self._save_config()
+        self._start_scan(
+            src   = self._src_edit.text().strip(),
+            dst   = self._dst_edit.text().strip(),
+            start = datetime(
+                self._start_date.date().year(),
+                self._start_date.date().month(),
+                self._start_date.date().day(),
+            ).date(),
+            end   = datetime(
+                self._end_date.date().year(),
+                self._end_date.date().month(),
+                self._end_date.date().day(),
+            ).date(),
+        )
 
-    def scan_files(self):
-        def scan():
-            self._cancel_event.clear()
-            self._ui_button(self.cancel_button, tk.NORMAL)
-            self.save_config()
+    def _start_scan(self, src: str, dst: str, start: date_type, end: date_type) -> None:
+        self._tree.clear()
+        self._files_to_copy.clear()
+        self._stats_label.setText("")
+        self._dir_cache = {}
+        self._progress.setValue(0)
+        self.statusBar().showMessage("Scanning…")
+        self._set_busy(True)
 
-            if not self.validate_paths():
-                self._ui_button(self.cancel_button, tk.DISABLED)
-                return
+        self._scan_thread = QThread()
+        self._scan_worker = ScanWorker(src, dst, start, end, self._dir_cache)
+        self._scan_worker.moveToThread(self._scan_thread)
 
-            start_date = self.start_date_picker.get_date()
-            end_date   = self.end_date_picker.get_date()
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_worker.finished.connect(self._scan_worker.deleteLater)
+        self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+        self._scan_thread.finished.connect(self._on_scan_thread_finished)
 
-            if start_date > end_date:
-                self._ui(lambda: messagebox.showerror(
-                    "Invalid Date Range",
-                    "Start date must be on or before end date.",
-                ))
-                self._ui_button(self.cancel_button, tk.DISABLED)
-                return
+        self._scan_worker.status_changed.connect(self.statusBar().showMessage)
+        self._scan_worker.progress_changed.connect(self._progress.setValue)
+        self._scan_worker.batch_ready.connect(self._on_batch_ready)
+        self._scan_worker.scan_stats.connect(self._on_scan_stats)
 
-            self._ui_tree_clear()
-            self.files_to_copy.clear()
-            self._ui_progress(0)
-            self._ui_status("Scanning...")
-            self._dir_cache = {}
+        self._scan_thread.start()
 
-            start_time     = time()
-            processed_files = 0
-            found_files    = 0
-            scanned_count  = 0
+    def _on_scan_thread_finished(self) -> None:
+        # In sync-all mode the copy starts immediately; don't un-busy the UI
+        if not self._sync_all_active:
+            self._set_busy(False)
 
-            def scan_directory(path):
-                try:
-                    with os.scandir(path) as entries:
-                        files, dirs = [], []
-                        for entry in entries:
-                            if entry.is_file():
-                                files.append(entry.name)
-                            elif entry.is_dir():
-                                dirs.append(entry.path)
-                        return files, dirs
-                except OSError:
-                    return [], []
+    def _on_scan_stats(self, stats: dict) -> None:
+        """Update the stats bar and, in Sync All mode, auto-start copy."""
+        self._last_scan_stats = stats
+        parts = [
+            f"{stats['scanned']} scanned",
+            f"{stats['to_copy']} to copy",
+            f"{stats['duplicates']} duplicates skipped",
+            f"{stats['undated']} undated",
+        ]
+        if stats["out_of_range"]:
+            parts.append(f"{stats['out_of_range']} outside date range")
+        parts.append(f"{stats['elapsed']:.1f}s")
+        self._stats_label.setText("  ·  ".join(parts))
 
-            dirs_to_scan = [self.source_folder.get()]
-            batch_files  = []
+        if self._sync_all_active:
+            if stats["to_copy"] > 0:
+                self._start_copy()
+            else:
+                # Nothing to copy for this profile — advance its date and move on
+                self._advance_profile_start_date(self._profile_combo.currentText())
+                self._next_sync_all_profile()
 
-            while dirs_to_scan:
-                if self._cancel_event.is_set():
-                    self._ui_status("Operation cancelled.")
-                    self._ui_button(self.cancel_button, tk.DISABLED)
+    def _on_batch_ready(self, batch: list) -> None:
+        for src, dst in batch:
+            self._files_to_copy.append((src, dst))
+            self._tree.addTopLevelItem(QTreeWidgetItem([src, dst]))
+
+    # ── Copy ─────────────────────────────────────────────────────────
+
+    def _copy_files(self) -> None:
+        if not self._files_to_copy:
+            QMessageBox.information(self, "No Files", "There are no files to copy.")
+            return
+        dst = self._dst_edit.text().strip()
+        try:
+            needed = sum(os.path.getsize(s) for s, _ in self._files_to_copy)
+            free   = shutil.disk_usage(dst).free
+            if needed > free:
+                reply = QMessageBox.question(
+                    self, "Low Disk Space",
+                    f"Not enough free space on destination.\n"
+                    f"Needed:    {needed / 1024**2:.1f} MB\n"
+                    f"Available: {free   / 1024**2:.1f} MB\n\nProceed anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.No:
                     return
+        except OSError:
+            pass
+        self._start_copy()
 
-                current_dir = dirs_to_scan.pop()
-                files, subdirs = scan_directory(current_dir)
-                dirs_to_scan.extend(subdirs)
-                found_files += len(files)
+    def _start_copy(self) -> None:
+        dst = self._dst_edit.text().strip()
+        self._progress.setValue(0)
+        self.statusBar().showMessage("Copying…")
+        self._set_busy(True)
 
-                for file in files:
-                    if self._cancel_event.is_set():
-                        self._ui_status("Operation cancelled.")
-                        self._ui_button(self.cancel_button, tk.DISABLED)
-                        return
+        self._copy_thread = QThread()
+        self._copy_worker = CopyWorker(list(self._files_to_copy), dst)
+        self._copy_worker.moveToThread(self._copy_thread)
 
-                    scanned_count += 1
-                    if not self.is_media_file(file):
-                        continue
+        self._copy_thread.started.connect(self._copy_worker.run)
+        self._copy_worker.finished.connect(self._copy_thread.quit)
+        self._copy_worker.finished.connect(self._copy_worker.deleteLater)
+        self._copy_thread.finished.connect(self._copy_thread.deleteLater)
+        self._copy_thread.finished.connect(self._on_copy_thread_finished)
 
-                    file_path = os.path.normpath(os.path.join(current_dir, file))
-                    date = self.get_file_date(file_path)
+        self._copy_worker.status_changed.connect(self.statusBar().showMessage)
+        self._copy_worker.progress_changed.connect(self._progress.setValue)
+        self._copy_worker.fatal_error.connect(self._on_copy_fatal)
+        self._copy_worker.finished.connect(self._on_copy_finished)
 
-                    if date and not (start_date <= date.date() <= end_date):
-                        continue
+        self._copy_thread.start()
 
-                    if date:
-                        year_folder = os.path.normpath(
-                            os.path.join(self.dest_root_folder.get(), str(date.year))
-                        )
-                        date_folder = self.find_matching_folder(date) or os.path.normpath(
-                            os.path.join(year_folder, date.strftime("%Y-%m-%d"))
-                        )
-                    else:
-                        date_folder = os.path.normpath(
-                            os.path.join(self.dest_root_folder.get(), "Undated")
-                        )
+    def _on_copy_thread_finished(self) -> None:
+        if not self._sync_all_active:
+            self._set_busy(False)
 
-                    dest_file_path = os.path.normpath(os.path.join(date_folder, file))
+    def _on_copy_fatal(self, title: str, msg: str) -> None:
+        QMessageBox.critical(self, title, msg)
+        # Abort sync all on fatal error
+        if self._sync_all_active:
+            self._sync_all_active = False
+            self._sync_all_queue.clear()
+            self._set_busy(False)
 
-                    if os.path.exists(dest_file_path):
-                        try:
-                            if (os.path.getsize(file_path) == os.path.getsize(dest_file_path)
-                                    and self.files_are_identical(file_path, dest_file_path)):
-                                continue
-                            base, ext = os.path.splitext(dest_file_path)
-                            counter = 1
-                            while os.path.exists(dest_file_path):
-                                dest_file_path = os.path.normpath(f"{base}_{counter}{ext}")
-                                counter += 1
-                        except OSError:
-                            pass
+    def _on_copy_finished(
+        self, copied: int, elapsed: float, audit_log: object, cancelled: bool
+    ) -> None:
+        profile_name = self._profile_combo.currentText()
 
-                    batch_files.append((file_path, dest_file_path))
-                    processed_files += 1
-
-                    if len(batch_files) >= 50:
-                        rows = list(batch_files)
-                        for src, dst in rows:
-                            self.files_to_copy.append((src, dst))
-                        self._ui_tree_insert(rows)
-                        batch_files.clear()
-                        self._ui_progress((scanned_count / max(found_files, 1)) * 100)
-                        self._ui_status(
-                            f"Scanning... {scanned_count}/{found_files} files processed. "
-                            f"Found {processed_files} to copy."
-                        )
-
-                if found_files > 0 and found_files % 500 == 0:
-                    self._ui_status(f"Found {found_files} files, processed {processed_files}")
-
-            # Flush remaining batch
-            for src, dst in batch_files:
-                self.files_to_copy.append((src, dst))
-            self._ui_tree_insert(batch_files)
-
-            elapsed = time() - start_time
-            self._ui_status(
-                f"Scanned {scanned_count} files. "
-                f"{len(self.files_to_copy)} new files ready to copy. "
-                f"Time: {elapsed:.2f}s"
-            )
-            self._ui_button(self.cancel_button, tk.DISABLED)
-
-        threading.Thread(target=scan, daemon=True).start()
-
-    # ------------------------------------------------------------------
-    # Copy
-    # ------------------------------------------------------------------
-
-    def _copy_single_file(self, src: str, dst: str) -> str:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-        return dst
-
-    def copy_files(self):
-        if not self.files_to_copy:
-            messagebox.showinfo("No Files", "There are no files to copy.")
+        if cancelled:
+            self.statusBar().showMessage(f"Cancelled — {copied} files copied before stopping.")
+            if self._sync_all_active:
+                self._sync_all_active = False
+                self._sync_all_queue.clear()
+                self._set_busy(False)
             return
 
-        def do_copy():
-            self._cancel_event.clear()
-            self._ui_button(self.cancel_button, tk.NORMAL)
+        self._write_audit_log(audit_log)  # type: ignore[arg-type]
 
-            total = len(self.files_to_copy)
-            self._ui_progress(0)
-            self._ui_status("Copying...")
+        if copied > 0:
+            # Auto-advance this profile's start date to today
+            self._advance_profile_start_date(profile_name)
 
-            # Pre-copy disk space check
-            try:
-                total_bytes = sum(os.path.getsize(s) for s, _ in self.files_to_copy)
-                free_bytes  = shutil.disk_usage(self.dest_root_folder.get()).free
-                if total_bytes > free_bytes:
-                    needed_mb = total_bytes / (1024 ** 2)
-                    free_mb   = free_bytes  / (1024 ** 2)
-                    proceed = messagebox.askyesno(
-                        "Low Disk Space",
-                        f"Not enough free space on destination.\n"
-                        f"Needed: {needed_mb:.1f} MB  |  Available: {free_mb:.1f} MB\n\n"
-                        f"Proceed anyway?",
-                    )
-                    if not proceed:
-                        self._ui_button(self.cancel_button, tk.DISABLED)
-                        return
-            except OSError:
-                pass  # If we can't check, proceed optimistically
+        if self._sync_all_active:
+            self.statusBar().showMessage(
+                f"'{profile_name}' — {copied} files copied. Moving to next profile…"
+            )
+            self._next_sync_all_profile()
+        else:
+            self.statusBar().showMessage(f"Copied {copied} files in {elapsed:.2f}s.")
+            QMessageBox.information(self, "Done", f"Copied {copied} files.")
+            self._scan_files()  # rescan to confirm clean state
 
-            start_time   = time()
-            audit_log    = {}
-            copied_count = 0
-            max_workers  = min(10, os.cpu_count() or 4)
-            fatal_error  = False
+    # ── Sync All ─────────────────────────────────────────────────────
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {
-                    executor.submit(self._copy_single_file, src, dst): (src, dst)
-                    for src, dst in self.files_to_copy
-                }
-                for future in concurrent.futures.as_completed(future_to_file):
-                    if self._cancel_event.is_set():
-                        self._ui_status("Operation cancelled.")
-                        self._ui_button(self.cancel_button, tk.DISABLED)
-                        return
+    def _sync_all(self) -> None:
+        if not self._profiles:
+            QMessageBox.information(self, "No Profiles",
+                                    "Save at least one profile before using Sync All.")
+            return
+        self._sync_all_queue  = sorted(self._profiles.keys())
+        self._sync_all_active = True
+        self.statusBar().showMessage(
+            f"Sync All starting — {len(self._sync_all_queue)} profiles…"
+        )
+        self._next_sync_all_profile()
 
-                    src, dst = future_to_file[future]
+    def _next_sync_all_profile(self) -> None:
+        if not self._sync_all_queue:
+            # All profiles done
+            self._sync_all_active = False
+            self._set_busy(False)
+            QMessageBox.information(self, "Sync All Complete",
+                                    "All profiles have been synced.")
+            self.statusBar().showMessage("Sync All complete.")
+            return
+
+        name    = self._sync_all_queue.pop(0)
+        profile = self._profiles.get(name)
+        if not profile:
+            self._next_sync_all_profile()
+            return
+
+        # Load the profile into the UI
+        self._profile_combo.blockSignals(True)
+        idx = self._profile_combo.findText(name)
+        if idx >= 0:
+            self._profile_combo.setCurrentIndex(idx)
+        self._profile_combo.blockSignals(False)
+        self._loading_profile = True
+        try:
+            self._src_edit.setText(profile.get("source_folder", ""))
+            self._dst_edit.setText(profile.get("dest_root_folder", ""))
+            for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
+                val = profile.get(key, "")
+                if val:
                     try:
-                        future.result()
-                        copied_count += 1
-                        audit_log.setdefault(os.path.dirname(dst), []).append(os.path.basename(dst))
+                        d = datetime.strptime(val, "%Y-%m-%d").date()
+                        picker.setDate(QDate(d.year, d.month, d.day))
+                    except ValueError:
+                        pass
+        finally:
+            self._loading_profile = False
 
-                        if copied_count % 5 == 0 or copied_count == total:
-                            self._ui_progress((copied_count / total) * 100)
-                        self._ui_status(
-                            f"Copying {os.path.basename(src)} "
-                            f"({copied_count}/{total})"
-                        )
-                    except FileNotFoundError:
-                        log.warning("Source file not found (skipped): %s", src)
-                    except PermissionError as e:
-                        log.error("Permission denied copying %s: %s", src, e)
-                        self._ui_show_error(
-                            "Permission Error",
-                            f"Permission denied:\n{src}\n\nCopy stopped.",
-                        )
-                        fatal_error = True
-                        break
-                    except OSError as e:
-                        # Covers disk-full (ENOSPC) and other IO errors
-                        log.error("OS error copying %s: %s", src, e)
-                        self._ui_show_error(
-                            "Copy Error",
-                            f"Failed to copy:\n{src}\n\n{e}\n\nCopy stopped.",
-                        )
-                        fatal_error = True
-                        break
-                    except Exception as e:
-                        log.error("Unexpected error copying %s: %s", src, e)
+        src = profile.get("source_folder", "")
+        dst = profile.get("dest_root_folder", "")
 
-            elapsed = time() - start_time
-            if not fatal_error:
-                self._ui_status(f"Copied {copied_count} files in {elapsed:.2f} seconds.")
-                self._ui_show_info("Done", f"Copied {copied_count} files.")
-            else:
-                self._ui_status(f"Stopped after {copied_count} files ({elapsed:.2f}s).")
-            self._ui_button(self.cancel_button, tk.DISABLED)
-            self.write_audit_log(audit_log)
-            self.scan_files()
+        # Skip profiles with missing/invalid paths rather than erroring
+        if not os.path.isdir(src) or not os.path.isdir(dst):
+            self.statusBar().showMessage(
+                f"Skipping '{name}' — source or destination folder not found."
+            )
+            self._next_sync_all_profile()
+            return
 
-        threading.Thread(target=do_copy, daemon=True).start()
+        remaining = len(self._sync_all_queue)
+        self.statusBar().showMessage(
+            f"Syncing '{name}'… ({remaining} profile{'s' if remaining != 1 else ''} remaining)"
+        )
 
-    # ------------------------------------------------------------------
-    # Audit log
-    # ------------------------------------------------------------------
+        qsd   = self._start_date.date()
+        qed   = self._end_date.date()
+        start = datetime(qsd.year(), qsd.month(), qsd.day()).date()
+        end   = datetime(qed.year(), qed.month(), qed.day()).date()
+        self._start_scan(src, dst, start, end)
 
-    def write_audit_log(self, audit_log: dict):
+    # ── Cancel ───────────────────────────────────────────────────────
+
+    def _cancel_operation(self) -> None:
+        if self._scan_worker:
+            self._scan_worker.cancel()
+        if self._copy_worker:
+            self._copy_worker.cancel()
+        if self._sync_all_active:
+            self._sync_all_active = False
+            self._sync_all_queue.clear()
+        self.statusBar().showMessage("Cancelling…")
+
+    # ── Audit log ────────────────────────────────────────────────────
+
+    def _write_audit_log(self, audit_log: dict[str, list[str]]) -> None:
         if not audit_log:
             return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file  = os.path.normpath(
-            os.path.join(self.dest_root_folder.get(), f"audit_log_{timestamp}.txt")
+        path      = os.path.join(
+            self._dst_edit.text().strip(), f"audit_log_{timestamp}.txt"
         )
         try:
-            with open(log_file, 'w') as f:
+            with open(path, "w") as f:
                 for folder in sorted(audit_log):
                     f.write(f"Folder: {os.path.normpath(folder)}\n")
-                    for filename in sorted(audit_log[folder]):
-                        f.write(f"  {filename}\n")
+                    for fname in sorted(audit_log[folder]):
+                        f.write(f"  {fname}\n")
                     f.write("\n")
-            log.info("Audit log written to %s", log_file)
+            log.info("Audit log written to %s", path)
         except Exception as e:
             log.error("Error writing audit log: %s", e)
 
-    # ------------------------------------------------------------------
-    # Cancel
-    # ------------------------------------------------------------------
 
-    def cancel_current_operation(self):
-        self._cancel_event.set()
-        self.status_text.set("Cancelling operation...")
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = PhotoOrganizer(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = PhotoOrganizer()
+    window.show()
+    sys.exit(app.exec())
