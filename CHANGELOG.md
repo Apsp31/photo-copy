@@ -5,6 +5,15 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [5.4.0] 2026-04-07
+- Scan stats bar shows: scanned · to copy · duplicates skipped · undated · outside date range · elapsed time
+- Auto-advance start date: after each successful copy the active profile's start date is moved to today
+- Sync All Profiles button: iterates every saved profile in sequence (scan → copy → advance date → next)
+  - Profiles with missing/offline source or destination are skipped with a status message
+  - Cancel stops the entire queue
+- Refactored scan/copy start into `_start_scan` / `_start_copy` helpers to support Sync All flow
+- `_on_scan_thread_finished` / `_on_copy_thread_finished` — prevent premature UI un-busy in Sync All mode
+
 ## [5.3.0] 2026-04-07
 - Added visible version number to title bar and status bar (permanent right-aligned label)
 - Added `APP_VERSION` constant to source; introduced CHANGELOG.md

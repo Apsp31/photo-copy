@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import date as date_type
 from datetime import datetime
 from time import time
 
@@ -61,7 +62,7 @@ from PySide6.QtWidgets import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.4.0"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
@@ -185,14 +186,15 @@ class ScanWorker(QObject):
     status_changed   = Signal(str)
     progress_changed = Signal(int)
     batch_ready      = Signal(list)   # list of (src_path, dst_path) tuples
+    scan_stats       = Signal(dict)   # emitted just before finished with summary stats
     finished         = Signal()
 
     def __init__(
         self,
         source: str,
         dest: str,
-        start_date,        # datetime.date
-        end_date,          # datetime.date
+        start_date: date_type,
+        end_date: date_type,
         dir_cache: dict,
     ):
         super().__init__()
@@ -225,7 +227,10 @@ class ScanWorker(QObject):
 
     def run(self) -> None:
         start_time    = time()
-        processed     = 0
+        to_copy       = 0
+        duplicates    = 0
+        undated       = 0
+        out_of_range  = 0
         found_files   = 0
         scanned_count = 0
 
@@ -269,7 +274,10 @@ class ScanWorker(QObject):
                 fp   = os.path.normpath(os.path.join(current_dir, file))
                 date = get_file_date(fp)
 
-                if date and not (self.start_date <= date.date() <= self.end_date):
+                if date is None:
+                    undated += 1
+                elif not (self.start_date <= date.date() <= self.end_date):
+                    out_of_range += 1
                     continue
 
                 if date:
@@ -288,6 +296,7 @@ class ScanWorker(QObject):
                             os.path.getsize(fp) == os.path.getsize(dst)
                             and files_are_identical(fp, dst)
                         ):
+                            duplicates += 1
                             continue
                         base, ext = os.path.splitext(dst)
                         n = 1
@@ -298,7 +307,7 @@ class ScanWorker(QObject):
                         pass
 
                 batch.append((fp, dst))
-                processed += 1
+                to_copy += 1
 
                 if len(batch) >= 50:
                     self.batch_ready.emit(list(batch))
@@ -308,22 +317,27 @@ class ScanWorker(QObject):
                     )
                     self.status_changed.emit(
                         f"Scanning… {scanned_count}/{found_files} files · "
-                        f"{processed} to copy"
+                        f"{to_copy} to copy"
                     )
 
             if found_files > 0 and found_files % 500 == 0:
                 self.status_changed.emit(
-                    f"Found {found_files} files, {processed} to copy…"
+                    f"Found {found_files} files, {to_copy} to copy…"
                 )
 
         if batch:
             self.batch_ready.emit(list(batch))
 
         elapsed = time() - start_time
-        self.status_changed.emit(
-            f"Scan complete — {scanned_count} files scanned, "
-            f"{processed} to copy ({elapsed:.1f}s)"
-        )
+        stats = {
+            "scanned":      scanned_count,
+            "to_copy":      to_copy,
+            "duplicates":   duplicates,
+            "undated":      undated,
+            "out_of_range": out_of_range,
+            "elapsed":      elapsed,
+        }
+        self.scan_stats.emit(stats)
         self.finished.emit()
 
 
@@ -338,8 +352,8 @@ class CopyWorker(QObject):
     """
     status_changed   = Signal(str)
     progress_changed = Signal(int)
-    fatal_error      = Signal(str, str)            # title, message
-    finished         = Signal(int, float, object, bool)  # copied, elapsed, audit_log, cancelled
+    fatal_error      = Signal(str, str)                        # title, message
+    finished         = Signal(int, float, object, bool)        # copied, elapsed, audit_log, cancelled
 
     def __init__(self, files_to_copy: list[tuple[str, str]], dest: str):
         super().__init__()
@@ -419,16 +433,21 @@ class PhotoOrganizer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Photo Organizer v{APP_VERSION}")
-        self.resize(960, 640)
+        self.resize(960, 660)
 
-        self._files_to_copy: list[tuple[str, str]] = []
-        self._dir_cache:     dict                  = {}
-        self._scan_thread:   QThread | None        = None
-        self._copy_thread:   QThread | None        = None
-        self._scan_worker:   ScanWorker | None     = None
-        self._copy_worker:   CopyWorker | None     = None
-        self._profiles:      dict                  = {}   # name → {source, dest, start, end}
-        self._loading_profile = False               # guard against recursive saves
+        self._files_to_copy:   list[tuple[str, str]] = []
+        self._dir_cache:       dict                  = {}
+        self._scan_thread:     QThread | None        = None
+        self._copy_thread:     QThread | None        = None
+        self._scan_worker:     ScanWorker | None     = None
+        self._copy_worker:     CopyWorker | None     = None
+        self._profiles:        dict                  = {}   # name → {source, dest, start, end}
+        self._loading_profile: bool                  = False
+        self._last_scan_stats: dict                  = {}
+
+        # Sync All state
+        self._sync_all_active: bool       = False
+        self._sync_all_queue:  list[str]  = []
 
         self._build_ui()
         self._load_config()
@@ -495,6 +514,10 @@ class PhotoOrganizer(QMainWindow):
         self._copy_btn.clicked.connect(self._copy_files)
         btn_row.addWidget(self._copy_btn)
 
+        self._sync_all_btn = QPushButton("Sync All Profiles")
+        self._sync_all_btn.clicked.connect(self._sync_all)
+        btn_row.addWidget(self._sync_all_btn)
+
         open_btn = QPushButton("Open Destination")
         open_btn.clicked.connect(self._open_destination)
         btn_row.addWidget(open_btn)
@@ -509,6 +532,11 @@ class PhotoOrganizer(QMainWindow):
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._tree_context_menu)
         vbox.addWidget(self._tree)
+
+        # Scan stats bar — shown after each scan
+        self._stats_label = QLabel("")
+        self._stats_label.setStyleSheet("color: #555; font-size: 11px; padding: 2px 0;")
+        vbox.addWidget(self._stats_label)
 
         # Progress bar
         self._progress = QProgressBar()
@@ -576,12 +604,6 @@ class PhotoOrganizer(QMainWindow):
 
     @staticmethod
     def _suggest_profile_name(source_path: str) -> str:
-        """
-        Derive a sensible profile name from the source path.
-        Walks up the path components looking for something that looks like a
-        phone/device name (e.g. 'iPhone 14', 'Galaxy S23', 'Pixel 7').
-        Falls back to the last non-empty path component.
-        """
         parts = [p for p in re.split(r"[\\/]", source_path) if p]
         _device_hints = re.compile(
             r"(iphone|ipad|galaxy|pixel|samsung|huawei|oneplus|xiaomi|oppo|sony|nokia|lg|moto)",
@@ -593,10 +615,9 @@ class PhotoOrganizer(QMainWindow):
         return parts[-1] if parts else "New Profile"
 
     def _populate_profile_combo(self, select_name: str = "") -> None:
-        """Rebuild the combo from self._profiles, optionally selecting select_name."""
         self._profile_combo.blockSignals(True)
         self._profile_combo.clear()
-        self._profile_combo.addItem("")          # blank = no profile loaded
+        self._profile_combo.addItem("")
         for name in sorted(self._profiles):
             self._profile_combo.addItem(name)
         if select_name:
@@ -627,20 +648,16 @@ class PhotoOrganizer(QMainWindow):
             self._loading_profile = False
 
     def _save_profile(self) -> None:
-        """Save current fields as a named profile, auto-suggesting a name."""
         suggested = self._suggest_profile_name(self._src_edit.text().strip())
-        # If a profile is already selected, default to updating it
-        current = self._profile_combo.currentText()
+        current   = self._profile_combo.currentText()
         if current:
             suggested = current
-
         name, ok = QInputDialog.getText(
             self, "Save Profile", "Profile name:", text=suggested
         )
         if not ok or not name.strip():
             return
         name = name.strip()
-
         self._profiles[name] = {
             "source_folder":    self._src_edit.text().strip(),
             "dest_root_folder": self._dst_edit.text().strip(),
@@ -668,6 +685,26 @@ class PhotoOrganizer(QMainWindow):
             self._save_config()
             self.statusBar().showMessage(f"Profile '{name}' deleted.")
 
+    def _advance_profile_start_date(self, profile_name: str) -> None:
+        """
+        After a successful copy, move the profile's start_date to today so the
+        next sync automatically covers only new photos.
+        """
+        if not profile_name or profile_name not in self._profiles:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._profiles[profile_name]["start_date"] = today
+        # Update the picker live if this profile is still selected
+        if self._profile_combo.currentText() == profile_name:
+            self._loading_profile = True
+            try:
+                d = datetime.now().date()
+                self._start_date.setDate(QDate(d.year, d.month, d.day))
+            finally:
+                self._loading_profile = False
+        self._save_config()
+        log.info("Advanced start date for profile '%s' to %s", profile_name, today)
+
     # ── Config ───────────────────────────────────────────────────────
 
     def _load_config(self) -> None:
@@ -676,13 +713,9 @@ class PhotoOrganizer(QMainWindow):
         try:
             with open(self.CONFIG_FILE) as f:
                 cfg = json.load(f)
-
-            # Restore profiles first so the combo is populated before we set fields
-            self._profiles = cfg.get("profiles", {})
-            last_profile   = cfg.get("last_profile", "")
+            self._profiles    = cfg.get("profiles", {})
+            last_profile      = cfg.get("last_profile", "")
             self._populate_profile_combo(select_name=last_profile)
-
-            # Restore last-used fields (may be overridden by profile selection above)
             self._src_edit.setText(cfg.get("source_folder", ""))
             self._dst_edit.setText(cfg.get("dest_root_folder", ""))
             for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
@@ -693,7 +726,6 @@ class PhotoOrganizer(QMainWindow):
                         picker.setDate(QDate(d.year, d.month, d.day))
                     except ValueError:
                         pass
-
             geo = cfg.get("geometry", "")
             if geo:
                 try:
@@ -731,10 +763,8 @@ class PhotoOrganizer(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Source Folder")
         if path:
             self._src_edit.setText(os.path.normpath(path))
-            # Auto-suggest a profile name in the combo if no profile is active
             if not self._profile_combo.currentText():
                 suggested = self._suggest_profile_name(path)
-                # Just a hint — user still has to click Save Profile
                 self.statusBar().showMessage(
                     f"Tip: click 'Save Profile' to save this as '{suggested}'"
                 )
@@ -781,6 +811,7 @@ class PhotoOrganizer(QMainWindow):
         self._cancel_btn.setEnabled(busy)
         self._scan_btn.setEnabled(not busy)
         self._copy_btn.setEnabled(not busy)
+        self._sync_all_btn.setEnabled(not busy)
 
     # ── Scan ─────────────────────────────────────────────────────────
 
@@ -788,16 +819,25 @@ class PhotoOrganizer(QMainWindow):
         if not self._validate_paths() or not self._validate_dates():
             return
         self._save_config()
+        self._start_scan(
+            src   = self._src_edit.text().strip(),
+            dst   = self._dst_edit.text().strip(),
+            start = datetime(
+                self._start_date.date().year(),
+                self._start_date.date().month(),
+                self._start_date.date().day(),
+            ).date(),
+            end   = datetime(
+                self._end_date.date().year(),
+                self._end_date.date().month(),
+                self._end_date.date().day(),
+            ).date(),
+        )
 
-        src   = self._src_edit.text().strip()
-        dst   = self._dst_edit.text().strip()
-        qsd   = self._start_date.date()
-        qed   = self._end_date.date()
-        start = datetime(qsd.year(), qsd.month(), qsd.day()).date()
-        end   = datetime(qed.year(), qed.month(), qed.day()).date()
-
+    def _start_scan(self, src: str, dst: str, start: date_type, end: date_type) -> None:
         self._tree.clear()
         self._files_to_copy.clear()
+        self._stats_label.setText("")
         self._dir_cache = {}
         self._progress.setValue(0)
         self.statusBar().showMessage("Scanning…")
@@ -811,13 +851,41 @@ class PhotoOrganizer(QMainWindow):
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_worker.finished.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
-        self._scan_thread.finished.connect(lambda: self._set_busy(False))
+        self._scan_thread.finished.connect(self._on_scan_thread_finished)
 
         self._scan_worker.status_changed.connect(self.statusBar().showMessage)
         self._scan_worker.progress_changed.connect(self._progress.setValue)
         self._scan_worker.batch_ready.connect(self._on_batch_ready)
+        self._scan_worker.scan_stats.connect(self._on_scan_stats)
 
         self._scan_thread.start()
+
+    def _on_scan_thread_finished(self) -> None:
+        # In sync-all mode the copy starts immediately; don't un-busy the UI
+        if not self._sync_all_active:
+            self._set_busy(False)
+
+    def _on_scan_stats(self, stats: dict) -> None:
+        """Update the stats bar and, in Sync All mode, auto-start copy."""
+        self._last_scan_stats = stats
+        parts = [
+            f"{stats['scanned']} scanned",
+            f"{stats['to_copy']} to copy",
+            f"{stats['duplicates']} duplicates skipped",
+            f"{stats['undated']} undated",
+        ]
+        if stats["out_of_range"]:
+            parts.append(f"{stats['out_of_range']} outside date range")
+        parts.append(f"{stats['elapsed']:.1f}s")
+        self._stats_label.setText("  ·  ".join(parts))
+
+        if self._sync_all_active:
+            if stats["to_copy"] > 0:
+                self._start_copy()
+            else:
+                # Nothing to copy for this profile — advance its date and move on
+                self._advance_profile_start_date(self._profile_combo.currentText())
+                self._next_sync_all_profile()
 
     def _on_batch_ready(self, batch: list) -> None:
         for src, dst in batch:
@@ -830,10 +898,7 @@ class PhotoOrganizer(QMainWindow):
         if not self._files_to_copy:
             QMessageBox.information(self, "No Files", "There are no files to copy.")
             return
-
         dst = self._dst_edit.text().strip()
-
-        # Pre-copy disk space check
         try:
             needed = sum(os.path.getsize(s) for s, _ in self._files_to_copy)
             free   = shutil.disk_usage(dst).free
@@ -842,15 +907,17 @@ class PhotoOrganizer(QMainWindow):
                     self, "Low Disk Space",
                     f"Not enough free space on destination.\n"
                     f"Needed:    {needed / 1024**2:.1f} MB\n"
-                    f"Available: {free   / 1024**2:.1f} MB\n\n"
-                    f"Proceed anyway?",
+                    f"Available: {free   / 1024**2:.1f} MB\n\nProceed anyway?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.No:
                     return
         except OSError:
             pass
+        self._start_copy()
 
+    def _start_copy(self) -> None:
+        dst = self._dst_edit.text().strip()
         self._progress.setValue(0)
         self.statusBar().showMessage("Copying…")
         self._set_busy(True)
@@ -863,7 +930,7 @@ class PhotoOrganizer(QMainWindow):
         self._copy_worker.finished.connect(self._copy_thread.quit)
         self._copy_worker.finished.connect(self._copy_worker.deleteLater)
         self._copy_thread.finished.connect(self._copy_thread.deleteLater)
-        self._copy_thread.finished.connect(lambda: self._set_busy(False))
+        self._copy_thread.finished.connect(self._on_copy_thread_finished)
 
         self._copy_worker.status_changed.connect(self.statusBar().showMessage)
         self._copy_worker.progress_changed.connect(self._progress.setValue)
@@ -872,19 +939,119 @@ class PhotoOrganizer(QMainWindow):
 
         self._copy_thread.start()
 
+    def _on_copy_thread_finished(self) -> None:
+        if not self._sync_all_active:
+            self._set_busy(False)
+
     def _on_copy_fatal(self, title: str, msg: str) -> None:
         QMessageBox.critical(self, title, msg)
+        # Abort sync all on fatal error
+        if self._sync_all_active:
+            self._sync_all_active = False
+            self._sync_all_queue.clear()
+            self._set_busy(False)
 
     def _on_copy_finished(
         self, copied: int, elapsed: float, audit_log: object, cancelled: bool
     ) -> None:
+        profile_name = self._profile_combo.currentText()
+
         if cancelled:
             self.statusBar().showMessage(f"Cancelled — {copied} files copied before stopping.")
+            if self._sync_all_active:
+                self._sync_all_active = False
+                self._sync_all_queue.clear()
+                self._set_busy(False)
             return
-        self.statusBar().showMessage(f"Copied {copied} files in {elapsed:.2f}s.")
-        QMessageBox.information(self, "Done", f"Copied {copied} files.")
+
         self._write_audit_log(audit_log)  # type: ignore[arg-type]
-        self._scan_files()                # auto-rescan to confirm clean state
+
+        if copied > 0:
+            # Auto-advance this profile's start date to today
+            self._advance_profile_start_date(profile_name)
+
+        if self._sync_all_active:
+            self.statusBar().showMessage(
+                f"'{profile_name}' — {copied} files copied. Moving to next profile…"
+            )
+            self._next_sync_all_profile()
+        else:
+            self.statusBar().showMessage(f"Copied {copied} files in {elapsed:.2f}s.")
+            QMessageBox.information(self, "Done", f"Copied {copied} files.")
+            self._scan_files()  # rescan to confirm clean state
+
+    # ── Sync All ─────────────────────────────────────────────────────
+
+    def _sync_all(self) -> None:
+        if not self._profiles:
+            QMessageBox.information(self, "No Profiles",
+                                    "Save at least one profile before using Sync All.")
+            return
+        self._sync_all_queue  = sorted(self._profiles.keys())
+        self._sync_all_active = True
+        self.statusBar().showMessage(
+            f"Sync All starting — {len(self._sync_all_queue)} profiles…"
+        )
+        self._next_sync_all_profile()
+
+    def _next_sync_all_profile(self) -> None:
+        if not self._sync_all_queue:
+            # All profiles done
+            self._sync_all_active = False
+            self._set_busy(False)
+            QMessageBox.information(self, "Sync All Complete",
+                                    "All profiles have been synced.")
+            self.statusBar().showMessage("Sync All complete.")
+            return
+
+        name    = self._sync_all_queue.pop(0)
+        profile = self._profiles.get(name)
+        if not profile:
+            self._next_sync_all_profile()
+            return
+
+        # Load the profile into the UI
+        self._profile_combo.blockSignals(True)
+        idx = self._profile_combo.findText(name)
+        if idx >= 0:
+            self._profile_combo.setCurrentIndex(idx)
+        self._profile_combo.blockSignals(False)
+        self._loading_profile = True
+        try:
+            self._src_edit.setText(profile.get("source_folder", ""))
+            self._dst_edit.setText(profile.get("dest_root_folder", ""))
+            for key, picker in (("start_date", self._start_date), ("end_date", self._end_date)):
+                val = profile.get(key, "")
+                if val:
+                    try:
+                        d = datetime.strptime(val, "%Y-%m-%d").date()
+                        picker.setDate(QDate(d.year, d.month, d.day))
+                    except ValueError:
+                        pass
+        finally:
+            self._loading_profile = False
+
+        src = profile.get("source_folder", "")
+        dst = profile.get("dest_root_folder", "")
+
+        # Skip profiles with missing/invalid paths rather than erroring
+        if not os.path.isdir(src) or not os.path.isdir(dst):
+            self.statusBar().showMessage(
+                f"Skipping '{name}' — source or destination folder not found."
+            )
+            self._next_sync_all_profile()
+            return
+
+        remaining = len(self._sync_all_queue)
+        self.statusBar().showMessage(
+            f"Syncing '{name}'… ({remaining} profile{'s' if remaining != 1 else ''} remaining)"
+        )
+
+        qsd   = self._start_date.date()
+        qed   = self._end_date.date()
+        start = datetime(qsd.year(), qsd.month(), qsd.day()).date()
+        end   = datetime(qed.year(), qed.month(), qed.day()).date()
+        self._start_scan(src, dst, start, end)
 
     # ── Cancel ───────────────────────────────────────────────────────
 
@@ -893,6 +1060,9 @@ class PhotoOrganizer(QMainWindow):
             self._scan_worker.cancel()
         if self._copy_worker:
             self._copy_worker.cancel()
+        if self._sync_all_active:
+            self._sync_all_active = False
+            self._sync_all_queue.clear()
         self.statusBar().showMessage("Cancelling…")
 
     # ── Audit log ────────────────────────────────────────────────────
