@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -62,7 +63,7 @@ from PySide6.QtWidgets import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-APP_VERSION = "5.5.0"
+APP_VERSION = "5.6.0"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
@@ -74,9 +75,27 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset({
     ".3gp", ".wmv", ".webm",
 })
 MEDIA_EXTENSIONS: frozenset[str] = frozenset({
+    # Standard images
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
-    ".heic", ".raw", ".cr2", ".nef", ".dng", ".arw", ".orf",
+    # Apple formats
+    ".heic", ".heif",           # HEIF still images (HEIF = container, HEIC = Apple flavour)
+    # RAW formats
+    ".raw", ".cr2", ".nef", ".dng", ".arw", ".orf",
+    # Modern image formats
+    ".webp",                    # WhatsApp, browser screenshots, cross-platform exports
+    ".avif",                    # iOS 16+ native support
+    ".jxl",                     # JPEG-XL — iPhone 16 Pro+
+    # Design / document
+    ".psd",                     # Photoshop / Lightroom exports
+    ".pdf",                     # Documents, scans
+    # Audio (voice memos, WhatsApp audio)
+    ".m4a",
 }) | VIDEO_EXTENSIONS
+
+# Sidecar formats intentionally excluded from MEDIA_EXTENSIONS:
+#   .aae  — Apple Photos edit instructions (XML); only useful alongside its companion HEIC/JPG
+#   .xmp  — Metadata sidecar; only useful alongside its companion RAW/DNG
+# These appear in the Skipped tab so users can review them.
 
 # EXIF tag IDs (checked in priority order)
 _EXIF_DATETIME_ORIGINAL  = 36867  # DateTimeOriginal
@@ -183,11 +202,12 @@ class ScanWorker(QObject):
     Scans source recursively for media files and determines destination paths.
     Runs in a QThread; communicates with the UI exclusively via signals.
     """
-    status_changed   = Signal(str)
-    progress_changed = Signal(int)
-    batch_ready      = Signal(list)   # list of (src_path, dst_path) tuples
-    scan_stats       = Signal(dict)   # emitted just before finished with summary stats
-    finished         = Signal()
+    status_changed      = Signal(str)
+    progress_changed    = Signal(int)
+    batch_ready         = Signal(list)   # list of (src_path, dst_path) tuples
+    skipped_batch_ready = Signal(list)   # list of (path, ext, reason) tuples
+    scan_stats          = Signal(dict)   # emitted just before finished with summary stats
+    finished            = Signal()
 
     def __init__(
         self,
@@ -247,8 +267,9 @@ class ScanWorker(QObject):
             except OSError:
                 return [], []
 
-        dirs_to_scan = [self.source]
-        batch: list  = []
+        dirs_to_scan  = [self.source]
+        batch: list   = []
+        skipped: list = []
 
         while dirs_to_scan:
             if self._cancel.is_set():
@@ -268,7 +289,13 @@ class ScanWorker(QObject):
                     return
 
                 scanned_count += 1
-                if os.path.splitext(file)[1].lower() not in MEDIA_EXTENSIONS:
+                ext = os.path.splitext(file)[1].lower()
+                if ext not in MEDIA_EXTENSIONS:
+                    fp = os.path.normpath(os.path.join(current_dir, file))
+                    skipped.append((fp, ext or "(no extension)", "Unsupported format"))
+                    if len(skipped) >= 50:
+                        self.skipped_batch_ready.emit(list(skipped))
+                        skipped.clear()
                     continue
 
                 fp   = os.path.normpath(os.path.join(current_dir, file))
@@ -327,6 +354,8 @@ class ScanWorker(QObject):
 
         if batch:
             self.batch_ready.emit(list(batch))
+        if skipped:
+            self.skipped_batch_ready.emit(list(skipped))
 
         elapsed = time() - start_time
         stats = {
@@ -523,7 +552,10 @@ class PhotoOrganizer(QMainWindow):
         btn_row.addWidget(open_btn)
         vbox.addLayout(btn_row)
 
-        # File list (two-column tree)
+        # Tabbed file lists
+        self._tabs = QTabWidget()
+
+        # Tab 1 — files to copy
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Source File", "Target Path"])
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -531,7 +563,17 @@ class PhotoOrganizer(QMainWindow):
         self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._tree_context_menu)
-        vbox.addWidget(self._tree)
+        self._tabs.addTab(self._tree, "To Copy")
+
+        # Tab 2 — skipped (unsupported format) files
+        self._skipped_tree = QTreeWidget()
+        self._skipped_tree.setHeaderLabels(["File", "Extension", "Reason"])
+        self._skipped_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._skipped_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._skipped_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._tabs.addTab(self._skipped_tree, "Skipped")
+
+        vbox.addWidget(self._tabs)
 
         # Scan stats bar — shown after each scan
         self._stats_label = QLabel("")
@@ -836,8 +878,11 @@ class PhotoOrganizer(QMainWindow):
 
     def _start_scan(self, src: str, dst: str, start: date_type, end: date_type) -> None:
         self._tree.clear()
+        self._skipped_tree.clear()
         self._files_to_copy.clear()
         self._stats_label.setText("")
+        self._tabs.setTabText(0, "To Copy")
+        self._tabs.setTabText(1, "Skipped")
         self._dir_cache = {}
         self._progress.setValue(0)
         self.statusBar().showMessage("Scanning…")
@@ -856,6 +901,7 @@ class PhotoOrganizer(QMainWindow):
         self._scan_worker.status_changed.connect(self.statusBar().showMessage)
         self._scan_worker.progress_changed.connect(self._progress.setValue)
         self._scan_worker.batch_ready.connect(self._on_batch_ready)
+        self._scan_worker.skipped_batch_ready.connect(self._on_skipped_batch_ready)
         self._scan_worker.scan_stats.connect(self._on_scan_stats)
 
         self._scan_thread.start()
@@ -891,6 +937,14 @@ class PhotoOrganizer(QMainWindow):
         for src, dst in batch:
             self._files_to_copy.append((src, dst))
             self._tree.addTopLevelItem(QTreeWidgetItem([src, dst]))
+        count = self._tree.topLevelItemCount()
+        self._tabs.setTabText(0, f"To Copy ({count:,})")
+
+    def _on_skipped_batch_ready(self, batch: list) -> None:
+        for path, ext, reason in batch:
+            self._skipped_tree.addTopLevelItem(QTreeWidgetItem([path, ext, reason]))
+        count = self._skipped_tree.topLevelItemCount()
+        self._tabs.setTabText(1, f"Skipped ({count:,})")
 
     # ── Copy ─────────────────────────────────────────────────────────
 
