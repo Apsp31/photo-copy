@@ -5,6 +5,10 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [5.6.1] 2026-04-08
+- Fixed: status bar kept showing "Scanning…" after scan completed with no files to copy
+- Status bar now shows "Scan complete — N file(s) ready to copy." or "Scan complete — no new files found."
+
 ## [5.6.0] 2026-04-08
 - Extended MEDIA_EXTENSIONS to 31 formats: added `.heif`, `.webp`, `.avif`, `.jxl` (modern image), `.psd` (Photoshop), `.pdf`, `.m4a` (iPhone voice memos / audio)
 - **Skipped files tab**: files with unsupported extensions are no longer silently ignored — they appear in a "Skipped (n)" tab showing file path, extension, and reason

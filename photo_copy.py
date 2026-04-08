@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-APP_VERSION = "5.6.0"
+APP_VERSION = "5.6.1"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
@@ -924,6 +924,15 @@ class PhotoOrganizer(QMainWindow):
             parts.append(f"{stats['out_of_range']} outside date range")
         parts.append(f"{stats['elapsed']:.1f}s")
         self._stats_label.setText("  ·  ".join(parts))
+
+        if stats["to_copy"] > 0:
+            self.statusBar().showMessage(
+                f"Scan complete — {stats['to_copy']} file(s) ready to copy."
+            )
+        else:
+            self.statusBar().showMessage(
+                "Scan complete — no new files found."
+            )
 
         if self._sync_all_active:
             if stats["to_copy"] > 0:
