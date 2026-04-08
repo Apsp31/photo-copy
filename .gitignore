@@ -5,3 +5,6 @@ config.json
 audit_log_*.txt
 .venv/
 venv/
+build/
+dist/
+*.spec.bak

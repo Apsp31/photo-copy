@@ -5,6 +5,12 @@ Format: `[version] YYYY-MM-DD — summary`
 
 ---
 
+## [5.5.0] 2026-04-08
+- PyInstaller spec added — builds a standalone single-file `PhotoOrganizer.exe` (no Python required)
+- `requirements.txt` added (`PySide6>=6.0.0`, `Pillow>=8.2.0`)
+- `build/`, `dist/`, `*.spec.bak` added to `.gitignore`
+- Closes GitHub issues #1 and #2
+
 ## [5.4.0] 2026-04-07
 - Scan stats bar shows: scanned · to copy · duplicates skipped · undated · outside date range · elapsed time
 - Auto-advance start date: after each successful copy the active profile's start date is moved to today

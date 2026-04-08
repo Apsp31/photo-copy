@@ -62,7 +62,7 @@ from PySide6.QtWidgets import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.5.0"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
